@@ -1,0 +1,64 @@
+---
+title: "풀스택 기술 레이어 이해하기"
+description: "React → Nginx → FastAPI → SQLAlchemy → PostgreSQL 전체 요청 흐름"
+category: "dev/backend"
+date: "2026-03-24"
+tags: ["fullstack", "architecture", "fastapi", "react"]
+---
+
+# 풀스택 기술 레이어 이해하기
+
+프론트엔드에서 DB까지 데이터가 저장되는 전체 과정을 이해합니다.
+
+## 요청 흐름 개요
+
+```
+프론트엔드 (React)
+  ↓ HTTP 요청
+Nginx
+  ↓ 전달
+FastAPI 라우터
+  ↓ 함수 호출
+Service Layer
+  ↓ 함수 호출
+SQLAlchemy ORM
+  ↓ SQL 쿼리
+asyncpg
+  ↓ TCP 소켓
+PostgreSQL DB
+```
+
+## 각 레이어 상세
+
+### 1. 프론트엔드 (React + axios)
+- 사용자 액션 → React 이벤트 핸들러 → axios HTTP 요청
+- 예: `axios.patch('/api/v1/departments/76', data)`
+
+### 2. Nginx 리버스 프록시
+- 클라이언트 요청을 백엔드 서버로 전달
+- Docker 환경에서 포트 매핑 및 로드밸런싱
+
+### 3. FastAPI 라우터
+- URL 경로와 HTTP 메서드를 Python 함수에 매핑
+- 요청 검증 (Pydantic), 의존성 주입 (Depends)
+
+### 4. Service Layer (비즈니스 로직)
+- 실제 비즈니스 규칙 처리
+- DB 조회, 데이터 변환, 검증
+
+### 5. SQLAlchemy ORM
+- Python 객체 ↔ SQL 쿼리 변환
+- `session.execute()`, `session.commit()`
+
+### 6. asyncpg 드라이버
+- PostgreSQL과의 비동기 TCP 통신
+- SQLAlchemy가 내부적으로 사용
+
+### 7. PostgreSQL DB
+- 실제 데이터 저장
+- ACID 트랜잭션 보장
+
+## 핵심 원칙
+
+> 각 계층은 바로 아래 계층만 알고, 두 단계 아래는 모른다.
+> 예: FastAPI 라우터는 Service를 호출하지만 asyncpg의 존재는 모른다.
