@@ -1,0 +1,324 @@
+---
+title: "Edge 확장 프로그램으로 DOM 원격 제어 — 디버깅 과정 기록"
+description: "보안프로그램으로 디버깅 모드가 차단된 환경에서 Edge 확장 + Python 서버로 DOM을 제어하며 겪은 에러와 해결 과정"
+category: "dev/browser"
+date: "2026-03-25"
+tags: ["edge-extension", "cors", "csp", "service-worker", "debugging", "manifest-v3"]
+---
+
+# Edge 확장 프로그램으로 DOM 원격 제어 — 디버깅 과정 기록
+
+보안프로그램이 CDP(Chrome DevTools Protocol)를 차단하는 환경에서, Edge 확장 프로그램 + Python Flask 서버로 DOM을 원격 제어하는 도구를 만들며 겪은 에러와 해결 과정을 정리한다.
+
+## 전체 구조도
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Edge Browser                            │
+│                                                                 │
+│  ┌─────────────────────────┐     ┌───────────────────────────┐  │
+│  │  Extension (MV3)        │     │  Web Page (naver.com)     │  │
+│  │                         │     │                           │  │
+│  │  ┌───────────────────┐  │     │  ┌─────────────────────┐  │  │
+│  │  │  background.js    │  │     │  │       DOM           │  │  │
+│  │  │  (Service Worker) │─────→  │  │  <html>             │  │  │
+│  │  │                   │  │ ⑤   │  │    <body>           │  │  │
+│  │  │  - poll /command  │  │     │  │      <div>...</div> │  │  │
+│  │  │  - post /result   │  │     │  │    </body>          │  │  │
+│  │  │  - executeScript  │  │     │  │  </html>            │  │  │
+│  │  └────────┬──────────┘  │     │  └─────────────────────┘  │  │
+│  │      ③④⑥ │ fetch       │     │                           │  │
+│  └───────────┼─────────────┘     │  ┌─────────────────────┐  │  │
+│              │                   │  │  content.js (v1.0)  │  │  │
+│              │                   │  │  (page context)     │  │  │
+│              │                   │  │  ※ removed in v2.0  │  │  │
+│              │                   │  └─────────┬───────────┘  │  │
+│              │                   │       ①ERR │ fetch        │  │
+└──────────────┼───────────────────┼────────────┼──────────────┘  │
+               │ allowed           │            │ blocked         │
+               ▼                   │            ▼                 │
+┌──────────────────────────────────┼─────────────────────────────┘
+│           Network (localhost:5000)                               │
+└──────────────┬───────────────────────────────────────────────────┘
+               │
+┌──────────────▼──────────────────────────────────────────────────┐
+│                    Python Flask Server                           │
+│                                                                  │
+│  GET  /command  ← extension polls (every 500ms)                  │
+│  POST /result   ← extension sends execution result              │
+│                                                                  │
+│  send()         → stores command in pending_command              │
+│                 → waits for result in results dict               │
+│                                                                  │
+│  controller.py  → dom.click(), dom.get_text(), etc.              │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+## 통신 흐름
+
+```
+①  Python:  dom.get_text("#title")
+     │
+     ▼
+②  send():  pending_command = {action:"getText", selector:"#title"}
+     │
+     ▼
+③  background.js:  fetch("localhost:5000/command") → receives command
+     │
+     ▼
+④  background.js:  chrome.scripting.executeScript() → inject into tab
+     │
+     ▼
+⑤  Page DOM:  document.querySelector("#title").innerText → "NAVER"
+     │
+     ▼
+⑥  background.js:  fetch("localhost:5000/result") → sends result
+     │
+     ▼
+⑦  send():  finds result in dict → returns to Python
+```
+
+## 에러 발생 위치
+
+```
+Python        Flask Server       background.js      content.js(v1)     Page DOM
+  │                │                   │                  │                │
+  │  ① send()      │                   │                  │                │
+  │───────────→ pending_cmd            │                  │                │
+  │                │                   │                  │                │
+  │                │  ③ GET /command    │                  │                │
+  │                │◄──────────────────│                  │                │
+  │                │                   │                  │                │
+  │                │          ┌────────┼──────────────────┤                │
+  │                │          │        │                  │                │
+  │                │          │   [ERR5] Command stolen   │                │
+  │                │          │   v1 content.js polls     │                │
+  │                │          │   /command, grabs it      │                │
+  │                │          │   before background.js    │                │
+  │                │          │        │                  │                │
+  │                │          │        │  [ERR1] CORS     │                │
+  │                │          │        │  fetch(localhost) │                │
+  │                │          │        │  → ✕ BLOCKED     │                │
+  │                │          │        │  Private Network │                │
+  │                │          │        │  Access policy   │                │
+  │                │          └────────┼──────────────────┘                │
+  │                │                   │                                   │
+  │                │             [ERR2,3] Cache                            │
+  │                │             Code updated but                          │
+  │                │             old version loaded                        │
+  │                │                   │                                   │
+  │                │                   │  ⑤ executeScript                  │
+  │                │                   │──────────────────────────────→    │
+  │                │                   │                                   │
+  │                │                   │                  [ERR4] CSP       │
+  │                │                   │                  eval() blocked   │
+  │                │                   │                  unsafe-eval      │
+  │                │                   │                  forbidden        │
+  │                │                   │                                   │
+  │                │                   │  ⑥ POST /result  (DOM API OK)    │
+  │                │◄──────────────────│◄──────────────────────────────    │
+  │                │                   │                                   │
+  │  ⑦ return      │                   │                                   │
+  │◄───────────────│                   │                                   │
+```
+
+| 순서 | 위치 | 에러 | 원인 |
+|---|---|---|---|
+| ERR1 | content.js → localhost | CORS / Private Network Access | 페이지 origin에서 loopback 접근 차단 |
+| ERR2 | Edge cache | `SERVER is not defined` | 수정된 파일이 반영 안 됨 |
+| ERR3 | Service Worker | 로그 없음 (미등록) | v1.0 manifest 캐시로 background 미등록 |
+| ERR4 | Page DOM | CSP eval 차단 | 네이버의 `unsafe-eval` 금지 정책 |
+| ERR5 | content.js(v1) → server | 명령 유실 | 이전 content.js가 탭에 남아 명령 가로채기 |
+
+이 구조에 도달하기까지 5단계의 디버깅을 거쳤다.
+
+---
+
+## 1단계: Private Network Access 차단 (CORS)
+
+### 증상
+
+```
+Access to fetch at 'http://localhost:5000/command' from origin 'https://www.naver.com'
+has been blocked by CORS policy: Permission was denied for this request
+to access the `loopback` address space.
+```
+
+### 원인
+
+content script는 페이지 컨텍스트에서 실행된다. `fetch("http://localhost:5000")`을 호출하면 브라우저는 이것을 **네이버 페이지가 localhost에 요청하는 것**으로 간주한다.
+
+Chromium 기반 브라우저는 **Private Network Access** 정책으로 외부 사이트 → localhost(loopback) 요청을 차단한다. 일반적인 CORS 헤더(`Access-Control-Allow-Origin`)와는 별개의 정책이다.
+
+### 시도한 해결 (실패)
+
+```python
+# 서버에 Private Network Access 헤더 추가
+@app.after_request
+def add_private_network_headers(response):
+    response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
+```
+
+헤더를 추가해도 차단됨. content script의 fetch는 페이지 origin을 따르기 때문.
+
+### 최종 해결
+
+content script에서 직접 fetch하지 않고 **background script(서비스 워커)**를 경유.
+
+```
+변경 전: content.js → fetch(localhost) → 차단
+변경 후: content.js → chrome.runtime.sendMessage → background.js → fetch(localhost) → 성공
+```
+
+서비스 워커는 확장 프로그램 컨텍스트에서 실행되므로, `host_permissions`에 명시된 URL로 자유롭게 fetch할 수 있다.
+
+### 핵심 개념
+
+| 실행 컨텍스트 | origin | localhost fetch |
+|---|---|---|
+| content script | 페이지 origin (naver.com) | Private Network Access로 차단 |
+| service worker | 확장 프로그램 origin | host_permissions에 따라 허용 |
+
+---
+
+## 2단계: 확장 캐시로 인한 코드 미갱신
+
+### 증상
+
+```
+Uncaught ReferenceError: SERVER is not defined at content.js:156:49
+```
+
+코드에서 `SERVER` 변수를 이미 제거했는데 여전히 에러 발생.
+
+### 원인
+
+Edge가 확장의 **이전 버전 파일을 캐시**하고 있었다. `edge://extensions`에서 새로고침 버튼을 눌러도 캐시가 남는 경우가 있다.
+
+### 해결
+
+1. 확장 **제거** 후 재설치
+2. Edge **완전 종료** (작업관리자에서 msedge.exe 모두 종료)
+3. `manifest.json`의 `version`을 `1.0` → `2.0`으로 변경하여 갱신 여부를 눈으로 확인
+
+### 교훈
+
+> 파일을 수정했다 ≠ 브라우저에 적용됐다. 버전 번호로 실제 갱신 여부를 반드시 확인하자.
+
+---
+
+## 3단계: 서비스 워커 미등록
+
+### 증상
+
+background.js의 서비스 워커 콘솔에 아무 로그도 나타나지 않음. `console.log("시작됨")` 조차 출력 안 됨.
+
+### 원인
+
+2단계와 동일 — 이전 v1.0 manifest(background 항목 없음)가 캐시되어 서비스 워커가 등록되지 않았음.
+
+### 해결
+
+확장 제거 → 재설치 후 `edge://extensions`에서 버전 2.0 확인, "서비스 작업자" 링크 존재 확인.
+
+### 디버깅 방법: 단계별 로그
+
+어느 단계에서 막히는지 파악하기 위해 각 지점에 로그를 삽입:
+
+```javascript
+// background.js
+console.log("[Background] 서비스 워커 시작됨");     // 등록 확인
+console.log("[Background] 메시지 수신:", msg.type); // 통신 확인
+console.log("[Background] 서버 응답:", data);        // fetch 확인
+console.log("[Background] 에러:", e.message);        // 에러 확인
+```
+
+---
+
+## 4단계: CSP로 eval 차단
+
+### 증상
+
+```
+Evaluating a string as JavaScript violates the following Content Security Policy directive
+because 'unsafe-eval' is not an allowed source of script
+```
+
+### 원인
+
+**CSP(Content Security Policy)** — 웹사이트가 HTTP 헤더로 "이 페이지에서 실행 가능한 스크립트 출처"를 제한하는 보안 정책.
+
+네이버는 CSP에서 `unsafe-eval`을 금지한다. `eval()`, `new Function()` 등 **문자열 → 코드 변환**이 모두 차단된다.
+
+```javascript
+// 차단됨 — 문자열을 코드로 해석
+eval(cmd.code);
+new Function(cmd.code)();
+
+// 허용됨 — 직접 DOM API 호출
+document.querySelector(selector).click();
+document.querySelector(selector).innerText;
+```
+
+### 해결
+
+`run_js()` (eval 기반) 대신 전용 명령(`get_url`, `get_text`, `click` 등)을 사용. DOM API 직접 호출은 CSP에 영향받지 않는다.
+
+### 핵심 개념
+
+| 코드 유형 | CSP 영향 | 예시 |
+|---|---|---|
+| eval / new Function | `unsafe-eval` 필요 | `eval("document.title")` |
+| 직접 DOM API 호출 | 영향 없음 | `document.querySelector(".title").innerText` |
+| 인라인 스크립트 | `unsafe-inline` 필요 | `<script>alert(1)</script>` |
+
+---
+
+## 5단계: 이전 content script의 명령 가로채기
+
+### 증상
+
+서버 로그에 GET /command만 대량 발생 (초당 7+ 요청), POST /result는 없음. Python 측에서 타임아웃.
+
+### 원인
+
+v1.0에서 사용하던 content.js가 **이미 열려있던 탭에서 아직 실행 중**이었다. manifest v2.0에서 content_scripts를 제거했지만, 이미 로드된 탭의 content script는 페이지를 닫기 전까지 살아있다.
+
+```
+이전 content.js (탭에 남아있음) → /command 폴링 → 명령 가져감 → localhost로 결과 전송 시도 → CORS 차단 → 결과 유실
+background.js (새로 등록됨) → /command 폴링 → 명령이 이미 없음 → 아무것도 못함
+```
+
+### 해결
+
+모든 Edge 탭을 닫고 새 탭으로 열어서 이전 content script를 제거.
+
+### 교훈
+
+> content script는 페이지가 열려있는 한 계속 실행된다. 확장을 업데이트해도 이미 열린 탭에는 이전 코드가 남아있다.
+
+---
+
+## 최종 구조 변경 요약
+
+```
+# v1.0 (실패)
+Python → Flask 서버 ← content.js(fetch) → DOM
+                       ↑ CORS 차단
+
+# v1.5 (실패)
+Python → Flask 서버 ← background.js(fetch) ← content.js(sendMessage) → DOM
+                                               ↑ 메시징 불안정
+
+# v2.0 (성공)
+Python → Flask 서버 ← background.js(fetch + chrome.scripting.executeScript) → DOM
+```
+
+v2.0에서는 content script를 완전히 제거하고, background의 서비스 워커가 서버 폴링과 DOM 주입을 모두 담당한다.
+
+---
+
+## 핵심 정리
+
+> **단계별 로그 삽입**이 디버깅의 핵심이다. "안 된다"는 정보만으로는 원인을 알 수 없고, 8단계 중 **어디서** 막히는지 좁혀야 한다. 각 단계에 로그를 넣고 하나씩 통과를 확인하며 범위를 좁혀가는 것이 체계적인 디버깅 방법이다.
