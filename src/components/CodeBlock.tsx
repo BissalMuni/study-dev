@@ -1,6 +1,9 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { isValidElement, useRef, useState } from "react";
+import dynamic from "next/dynamic";
+
+const Mermaid = dynamic(() => import("./Mermaid"), { ssr: false });
 
 interface CodeBlockProps {
   children: React.ReactNode;
@@ -10,6 +13,17 @@ interface CodeBlockProps {
 export default function CodeBlock({ children, className }: CodeBlockProps) {
   const [copied, setCopied] = useState(false);
   const preRef = useRef<HTMLPreElement>(null);
+
+  // mermaid 코드 블록 감지
+  const codeEl = isValidElement(children) ? children : null;
+  const codeClass =
+    (codeEl?.props as { className?: string })?.className || "";
+  if (codeClass.includes("language-mermaid")) {
+    const chart = String(
+      (codeEl?.props as { children?: string })?.children || ""
+    ).trim();
+    return <Mermaid chart={chart} />;
+  }
 
   const handleCopy = async () => {
     const text = preRef.current?.textContent || "";
