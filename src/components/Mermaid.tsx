@@ -41,7 +41,7 @@ export default function Mermaid({ chart }: { chart: string }) {
 
   return (
     <div
-      className="my-6 flex justify-center [&_svg]:max-w-full"
+      className="not-prose my-6 flex justify-center overflow-x-auto [&_svg]:max-w-full [&_svg]:h-auto"
       dangerouslySetInnerHTML={{ __html: svg }}
     />
   );
