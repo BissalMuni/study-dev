@@ -1,0 +1,202 @@
+---
+title: "HWPX 파싱 및 문서 생성"
+description: "한글 문서(HWPX) 포맷을 프로그래밍 방식으로 파싱하고 생성하는 기법"
+category: "etc/tool"
+date: "2026-04-07"
+tags: ["hwpx", "xml", "zip", "한글", "문서자동화", "go", "python"]
+---
+
+# HWPX 파싱 및 문서 생성
+
+HWPX는 한글오피스의 개방형 문서 포맷으로, 실체는 **ZIP 안에 XML 파일들**이 들어있는 구조다. 이를 이용하면 프로그래밍 방식으로 한글 문서를 읽고, 수정하고, 생성할 수 있다.
+
+## HWPX 파일 구조
+
+HWPX를 ZIP으로 해제하면 다음 구조가 나타난다:
+
+```
+파일.hwpx (ZIP)
+├── mimetype                     # "application/hwp+zip" (비압축 필수)
+├── META-INF/
+│   ├── container.xml
+│   └── manifest.xml
+├── Contents/
+│   ├── header.xml               # 폰트, 스타일, 문단속성 정의
+│   └── section0.xml             # ★ 실제 본문 (표, 텍스트)
+├── BinData/                     # 이미지 등 바이너리 데이터
+├── Preview/
+│   ├── PrvImage.png
+│   └── PrvText.txt
+├── Scripts/
+├── settings.xml
+└── version.xml
+```
+
+핵심은 두 파일이다:
+- **`header.xml`** — 스타일 정의 (글꼴, 크기, 테두리, 배경색 등의 ID 매핑)
+- **`section0.xml`** — 본문 내용 (텍스트, 표, 레이아웃)
+
+## section0.xml 핵심 XML 계층
+
+```xml
+<sec>                              <!-- 섹션 (페이지) -->
+  <p paraPrIDRef="20">             <!-- 문단 -->
+    <run charPrIDRef="10">         <!-- 글자속성 참조 -->
+      <tbl rowCnt="30" colCnt="8"> <!-- 표 -->
+        <tr>                       <!-- 행 -->
+          <tc borderFillIDRef="3"> <!-- 셀 -->
+            <subList>
+              <p>
+                <run charPrIDRef="7">
+                  <t>셀 텍스트</t>  <!-- ★ 교체 대상 -->
+                </run>
+              </p>
+            </subList>
+            <cellAddr colAddr="0" rowAddr="0"/>
+            <cellSpan colSpan="1" rowSpan="1"/>
+            <cellSz width="14191" height="1565"/>
+          </tc>
+        </tr>
+      </tbl>
+    </run>
+    <linesegarray>                 <!-- 줄 배치 정보 -->
+      <lineseg textpos="0" vertpos="0" vertsize="1000" .../>
+    </linesegarray>
+  </p>
+</sec>
+```
+
+## 스타일 ID 체계
+
+`header.xml`에서 정의된 ID를 `section0.xml`에서 참조하는 구조:
+
+| 속성 | 역할 | 예시 |
+|------|------|------|
+| `charPrIDRef` | 글자 속성 (크기, 굵기, 폰트) | `0`=본문10pt, `10`=헤더, `12`=제목16pt |
+| `paraPrIDRef` | 문단 속성 (정렬, 들여쓰기) | `0`=양쪽정렬, `20`=가운데정렬 |
+| `borderFillIDRef` | 셀 테두리 + 배경색 | `3`=기본, `10`=회색헤더, `4`=제목배경 |
+
+## 문서 생성 방식
+
+### 방식 1: 템플릿 텍스트 교체 (서식 100% 보존)
+
+원본 HWPX를 ZIP 해제 → `<t>` 텍스트만 교체 → 재패킹.
+표 레이아웃, 셀 병합, 스타일이 모두 원본 그대로 유지된다.
+
+```python
+# 출처: law-matcher-java/docs/security/cloud/generate_hwpx.py
+import zipfile, xml.etree.ElementTree as ET, shutil
+from pathlib import Path
+
+def extract_hwpx(hwpx_path, work_dir):
+    """HWPX(ZIP) 해제"""
+    with zipfile.ZipFile(hwpx_path, 'r') as zf:
+        zf.extractall(work_dir)
+
+def repack_hwpx(work_dir, output_path):
+    """HWPX(ZIP) 재패킹 — mimetype을 비압축으로 먼저 넣는다"""
+    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        mimetype_path = work_dir / 'mimetype'
+        if mimetype_path.exists():
+            zf.write(mimetype_path, 'mimetype',
+                     compress_type=zipfile.ZIP_STORED)  # 비압축 필수
+        for fp in work_dir.rglob('*'):
+            if fp.is_file() and fp.name != 'mimetype':
+                zf.write(fp, fp.relative_to(work_dir).as_posix())
+
+# 사용 예
+extract_hwpx(Path("template.hwpx"), Path("_work"))
+tree = ET.parse("_work/Contents/section0.xml")
+
+for t in tree.getroot().iter('{http://www.hancom.co.kr/hwpml/2011/paragraph}t'):
+    if t.text and "원본텍스트" in t.text:
+        t.text = "새로운텍스트"
+
+tree.write("_work/Contents/section0.xml", encoding='utf-8', xml_declaration=True)
+repack_hwpx(Path("_work"), Path("output.hwpx"))
+```
+
+### 방식 2: XML 신규 생성 (원본 템플릿이 없을 때)
+
+기존 HWPX의 `header.xml`(스타일)을 재사용하고, `section0.xml`을 프로그래밍 방식으로 구성한다.
+
+```python
+# 출처: law-matcher-java/docs/security/cloud/generate_hwpx.py
+NS_PARA = 'http://www.hancom.co.kr/hwpml/2011/paragraph'
+
+def make_tc(col, row, colSpan, rowSpan, width, height,
+            charPrIDRef, text, borderFillIDRef='3'):
+    """테이블 셀(<tc>) 요소 생성"""
+    tc = ET.Element(f'{{{NS_PARA}}}tc', attrib={
+        'borderFillIDRef': borderFillIDRef, ...
+    })
+    # subList > p > run > t 계층 구성
+    subList = ET.SubElement(tc, f'{{{NS_PARA}}}subList', ...)
+    p = ET.SubElement(subList, f'{{{NS_PARA}}}p', ...)
+    run = ET.SubElement(p, f'{{{NS_PARA}}}run',
+                        attrib={'charPrIDRef': str(charPrIDRef)})
+    t = ET.SubElement(run, f'{{{NS_PARA}}}t')
+    t.text = text
+    # cellAddr, cellSpan, cellSz 추가
+    ET.SubElement(tc, f'{{{NS_PARA}}}cellAddr',
+                  attrib={'colAddr': str(col), 'rowAddr': str(row)})
+    ET.SubElement(tc, f'{{{NS_PARA}}}cellSpan',
+                  attrib={'colSpan': str(colSpan), 'rowSpan': str(rowSpan)})
+    ET.SubElement(tc, f'{{{NS_PARA}}}cellSz',
+                  attrib={'width': str(width), 'height': str(height)})
+    return tc
+```
+
+## linesegarray 문제와 해결
+
+`linesegarray`는 각 줄의 위치(`vertpos`), 높이(`vertsize`), 시작 문자 인덱스(`textpos`)를 담고 있다. **원본 텍스트 길이에 맞춰져 있으므로** 텍스트를 교체하면 겹침이 발생한다.
+
+```
+원본: "금84,000,000원"         → lineseg: 1줄, vertsize=1000
+교체: "자치법규와 상위 법령..." → 실제 2줄인데 lineseg는 1줄 → 겹침!
+```
+
+**해결**: `linesegarray`를 제거하면 한글오피스가 문서를 열 때 자동으로 재계산한다.
+
+```python
+def remove_all_linesegs(root):
+    ns = 'http://www.hancom.co.kr/hwpml/2011/paragraph'
+    for p in root.iter(f'{{{ns}}}p'):
+        for lsa in p.findall(f'{{{ns}}}linesegarray'):
+            p.remove(lsa)
+```
+
+## 재패킹 시 주의사항
+
+`mimetype` 파일은 **비압축(ZIP_STORED)으로 첫 번째 엔트리**에 넣어야 한다. 그렇지 않으면 한글오피스가 파일을 인식하지 못한다.
+
+## 데스크탑 앱 구현 — Go + Wails
+
+Python으로 검증한 로직을 **Go + Wails**로 포팅하면 단일 `.exe` 배포가 가능하다.
+
+| 비교 | Python | Go |
+|------|--------|-----|
+| 배포 | Python 런타임 + venv + pip 필요 | **단일 .exe** (의존성 없음) |
+| GUI | PyQt/Tkinter (무거움) | **Wails** (React 내장 웹뷰, 50~80MB) |
+| ZIP+XML | `zipfile` + `ElementTree` | `archive/zip` + `encoding/xml` |
+| 크로스컴파일 | pyinstaller (불안정) | `GOOS=windows go build` |
+
+```go
+// Go에서 HWPX 파싱 예시
+z, _ := zip.OpenReader("template.hwpx")
+defer z.Close()
+for _, f := range z.File {
+    if f.Name == "Contents/section0.xml" {
+        rc, _ := f.Open()
+        decoder := xml.NewDecoder(rc)
+        // XML 파싱 → <t> 텍스트 교체
+    }
+}
+```
+
+## 핵심 정리
+
+> - HWPX = ZIP + XML. 어떤 언어든 ZIP 해제 → XML 파싱 → 재패킹으로 문서를 조작할 수 있다
+> - **템플릿 교체 방식**: 원본 서식 100% 보존. `<t>` 텍스트만 바꾸고 `linesegarray`를 제거하면 된다
+> - **신규 생성 방식**: `header.xml`(스타일)을 재사용하고 `section0.xml`을 코드로 구성
+> - 데스크탑 앱은 Go + Wails 조합이 배포/크기 면에서 최적
