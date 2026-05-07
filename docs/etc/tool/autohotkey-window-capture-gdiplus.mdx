@@ -1,0 +1,256 @@
+---
+title: "AutoHotkey v2로 비활성 창 캡처하기 — PrintWindow + GDI+ 함정"
+description: "다른 창에 가려져도 캡처 가능한 PrintWindow와 GDI+ 저장, 그리고 GdiplusStartup 반복 호출로 인한 프로세스 크래시 원인 분석"
+category: "etc/tool"
+date: "2026-05-07"
+tags: ["autohotkey", "ahk-v2", "windows-api", "gdi-plus", "printwindow", "screenshot", "uipi"]
+---
+
+# AutoHotkey v2로 비활성 창 캡처하기 — PrintWindow + GDI+ 함정
+
+비활성 상태이거나 다른 창에 가려진 특정 창을 PNG로 저장하는 AHK v2 스크립트를 만들 때 만난 세 가지 함정. 특히 **GDI+ 초기화를 캡처마다 반복하면 AHK 프로세스가 크래시**하는 게 핵심.
+
+## 핵심 개념
+
+비활성 창 캡처 = `PrintWindow` API + `PW_RENDERFULLCONTENT(0x2)` 플래그.
+저장 = GDI+의 `GdipCreateBitmapFromHBITMAP` → `GdipSaveImageToFile`.
+
+이 두 조합 자체는 정석인데, 다음 세 함정에 빠지기 쉽다:
+
+1. **UIPI**: 관리자 권한 창은 같은 권한 프로세스만 캡처 가능
+2. **GDI+ Startup/Shutdown 반복 호출 → 프로세스 크래시** (← 가장 치명적)
+3. **AHK 핫키는 자기 스크립트 다이얼로그에서도 발동** (`Esc::ExitApp`이 MsgBox 닫을 때 트리거)
+
+## 상세 설명
+
+### 1. PrintWindow + PW_RENDERFULLCONTENT
+
+`PrintWindow`는 창 핸들의 픽셀을 비트맵에 그려준다. 일반 캡처(BitBlt + 화면 좌표)와 달리 **다른 창에 가려져 있어도** 동작한다.
+
+```autohotkey
+; 출처: office/VS/find_and_click.ahk
+hdcSrc := DllCall("GetDC", "Ptr", hwnd, "Ptr")
+hdcDst := DllCall("CreateCompatibleDC", "Ptr", hdcSrc, "Ptr")
+hbm    := DllCall("CreateCompatibleBitmap", "Ptr", hdcSrc, "Int", w, "Int", h, "Ptr")
+obm    := DllCall("SelectObject", "Ptr", hdcDst, "Ptr", hbm, "Ptr")
+
+PW_RENDERFULLCONTENT := 0x00000002
+ok := DllCall("PrintWindow", "Ptr", hwnd, "Ptr", hdcDst, "UInt", PW_RENDERFULLCONTENT)
+```
+
+`PW_RENDERFULLCONTENT(0x2)` 플래그가 핵심이다. 이게 없으면 Chrome/VS Code 같은 GPU 가속 Electron 앱에서 검은 화면이 나온다. Windows 8.1+ 부터 지원하며, 클라이언트 영역까지 GPU 컴포지션 결과를 그대로 가져온다.
+
+> **단, 최소화 상태(`IsIconic`)인 창은 GPU 컨텍스트가 비활성이라 검게 나오는 경우가 많다.** 미리 걸러내거나, 일시적으로 복원했다가 캡처해야 한다.
+
+### 2. UIPI — 관리자 창은 관리자만 캡처
+
+Windows의 **UIPI(User Interface Privilege Isolation)** 정책 때문에, 일반 권한 프로세스는 관리자 권한 창의 픽셀을 읽을 수 없다.
+
+진단으로 확인 가능 — `WinGetTitle`이 `[Administrator]` 접미사를 보이면 그 창은 관리자.
+
+```
+[1] HWND=199210 1936x1056
+  class=Chrome_WidgetWin_1
+  title=find_and_click.ahk - office - Visual Studio Code [Administrator]
+```
+
+해결: AHK 스크립트도 관리자 권한으로 실행. 자동 권한 상승 패턴:
+
+```autohotkey
+; 출처: office/VS/find_and_click.ahk:5-12
+if !A_IsAdmin {
+    try {
+        Run('*RunAs "' A_ScriptFullPath '"')
+    } catch {
+        MsgBox("관리자 권한 상승 실패")
+    }
+    ExitApp()
+}
+```
+
+**팁**: 관리자 권한 VS Code/터미널에서 AHK 스크립트를 실행하면 자식 프로세스가 권한을 상속받아 UAC 프롬프트 없이 admin으로 시작한다.
+
+### 3. GDI+ Startup/Shutdown은 프로세스당 1회만
+
+이번 디버깅에서 가장 오래 헤맨 부분. 증상은:
+
+> Ctrl+F9 누르면 **첫 창은 잘 저장되지만, 두 번째 창부터 AHK 프로세스가 즉사**. try/catch로도 잡히지 않음.
+
+원인은 GDI+의 라이프사이클 모델이다.
+
+#### 잘못된 패턴 (크래시 유발)
+
+```autohotkey
+; ❌ 캡처 함수 안에서 매번 Startup/Shutdown
+SaveHBITMAPToPng(hbm, filename) {
+    pToken := 0
+    DllCall("gdiplus\GdiplusStartup", "Ptr*", &pToken, "Ptr", si, "Ptr", 0)
+    DllCall("gdiplus\GdipCreateBitmapFromHBITMAP", ...)
+    DllCall("gdiplus\GdipSaveImageToFile", ...)
+    DllCall("gdiplus\GdipDisposeImage", ...)
+    DllCall("gdiplus\GdiplusShutdown", "Ptr", pToken)  ; 매번 종료
+}
+```
+
+여러 창을 루프로 돌며 이 함수를 반복 호출하면:
+
+1. 1회차: `GdiplusStartup` → 내부 스레드/자원 초기화 → 저장 OK → `GdiplusShutdown`이 내부 자원 언로드
+2. 2회차: `GdiplusStartup` 재호출 → **내부 상태가 불안정한 상태에서 재초기화 시도**
+3. 그 직후 `GdipCreateBitmapFromHBITMAP` → DLL 내부 access violation → 프로세스 즉사
+
+이건 **네이티브 크래시**라서 AHK의 try/catch로 못 잡는다. 스크립트가 그냥 사라진다.
+
+#### 올바른 패턴 (프로세스 1회 init)
+
+Microsoft GDI+ 공식 가이드: **"GDI+는 프로세스당 한 번만 초기화하라."**
+
+```autohotkey
+; 출처: office/VS/find_and_click.ahk:27-33
+; 스크립트 시작 시 1회만 초기화
+global gdipToken := 0
+gdipInput := Buffer(24, 0)
+NumPut("UInt", 1, gdipInput, 0)  ; GdiplusStartupInput.GdiplusVersion = 1
+if DllCall("gdiplus\GdiplusStartup", "Ptr*", &gdipToken, "Ptr", gdipInput, "Ptr", 0)
+    MsgBox("GDI+ 초기화 실패")
+
+; 스크립트 종료 시 1회만 정리
+OnExit((*) => DllCall("gdiplus\GdiplusShutdown", "Ptr", gdipToken))
+```
+
+저장 함수에서는 Startup/Shutdown 없이 사용만:
+
+```autohotkey
+; 출처: office/VS/find_and_click.ahk:181-195
+SaveHBITMAPToPng(hbm, filename) {
+    pBitmap := 0
+    if DllCall("gdiplus\GdipCreateBitmapFromHBITMAP", "Ptr", hbm, "Ptr", 0, "Ptr*", &pBitmap)
+        return false
+    if !pBitmap
+        return false
+
+    pngClsid := Buffer(16, 0)
+    DllCall("ole32\CLSIDFromString", "WStr", "{557CF406-1A04-11D3-9A73-0000F81EF32E}", "Ptr", pngClsid)
+
+    status := DllCall("gdiplus\GdipSaveImageToFile", "Ptr", pBitmap, "WStr", filename, "Ptr", pngClsid, "Ptr", 0)
+
+    DllCall("gdiplus\GdipDisposeImage", "Ptr", pBitmap)
+    return (status = 0)
+}
+```
+
+### 4. AHK 핫키와 자기 다이얼로그 — Esc 함정
+
+AHK가 띄운 `MsgBox`를 닫을 때 누른 Esc는 **글로벌 핫키 `Esc::ExitApp`도 함께 트리거**한다. AHK 핫키는 메시지를 전역 후킹하기 때문에, 자기 스크립트가 띄운 다이얼로그도 예외가 아니다.
+
+증상: "MsgBox 뜨면 닫는 순간 스크립트가 꺼진다."
+
+해결: 종료 핫키에 모디파이어를 붙여 다이얼로그 닫기와 충돌하지 않게 한다.
+
+```autohotkey
+; ❌ Esc::ExitApp     ; MsgBox Esc 닫기에 같이 발동됨
+; ✅
+^!q::ExitApp           ; Ctrl+Alt+Q
+```
+
+## 실제 코드 예시 — 다중 창 안전 캡처
+
+여러 VS Code 창을 한 번에 캡처하는 패턴. **각 반복은 try/catch로 보호**하고, GDI+는 전역 1회 init.
+
+```autohotkey
+; 출처: office/VS/find_and_click.ahk:76-117
+CaptureVSCodeAll() {
+    hwnds := WinGetList("ahk_exe Code.exe")
+    if (hwnds.Length = 0) {
+        Notify("VS Code 창을 찾을 수 없습니다 (Code.exe)")
+        return
+    }
+
+    saved := 0
+    skipped := 0
+    log := ""
+    ; 명시적 index, value — 단일 변수 for의 모호함 방지
+    for index, hwnd in hwnds {
+        result := { path: "", reason: "" }
+        try {
+            result := CaptureWindowToPng(hwnd, index)
+        } catch as e {
+            result := { path: "", reason: "예외: " e.Message }
+        }
+        log .= "[" index "] HWND=" hwnd " => "
+            . (result.path ? "OK " result.path : "SKIP " result.reason) "`n"
+        if result.path
+            saved++
+        else
+            skipped++
+    }
+
+    msg := "VS Code 창 " hwnds.Length "개 발견 / " saved "개 저장 / " skipped "개 스킵`n`n" log
+    if (skipped > 0)
+        MsgBox(msg, "캡처 결과 (스킵 " skipped "개)", "T10")  ; 10초 자동 닫힘
+    else
+        Notify("VS Code 캡처: " saved "개 저장")
+}
+```
+
+`CaptureWindowToPng` 단일 창 캡처 (PrintWindow + GDI+ 저장):
+
+```autohotkey
+; 출처: office/VS/find_and_click.ahk:133-173
+CaptureWindowToPng(hwnd, index := 0) {
+    if DllCall("IsIconic", "Ptr", hwnd)
+        return { path: "", reason: "최소화" }
+
+    WinGetPos(, , &w, &h, "ahk_id " hwnd)
+    if (w <= 0 || h <= 0)
+        return { path: "", reason: "0크기" }
+
+    hdcSrc := DllCall("GetDC", "Ptr", hwnd, "Ptr")
+    hdcDst := DllCall("CreateCompatibleDC", "Ptr", hdcSrc, "Ptr")
+    hbm    := DllCall("CreateCompatibleBitmap", "Ptr", hdcSrc, "Int", w, "Int", h, "Ptr")
+    obm    := DllCall("SelectObject", "Ptr", hdcDst, "Ptr", hbm, "Ptr")
+
+    PW_RENDERFULLCONTENT := 0x00000002
+    ok := DllCall("PrintWindow", "Ptr", hwnd, "Ptr", hdcDst, "UInt", PW_RENDERFULLCONTENT)
+
+    savePath := A_ScriptDir "\capture_" FormatTime(, "yyyyMMdd_HHmmss") "_" index ".png"
+    saved := ok ? SaveHBITMAPToPng(hbm, savePath) : false
+
+    ; GDI 자원 정리 — 순서 중요: SelectObject로 비트맵 분리 후 Delete
+    DllCall("SelectObject", "Ptr", hdcDst, "Ptr", obm)
+    DllCall("DeleteObject", "Ptr", hbm)
+    DllCall("DeleteDC", "Ptr", hdcDst)
+    DllCall("ReleaseDC", "Ptr", hwnd, "Ptr", hdcSrc)
+
+    return saved ? { path: savePath, reason: "" } : { path: "", reason: "캡처 실패" }
+}
+```
+
+## 디버깅 시 유용했던 패턴
+
+### "스크립트가 살아있나?" 신호 보내기
+
+DllCall이 메모리를 망가뜨리면 try/catch가 무력하다. 대신 **함수 끝에 짧은 지연 후 Notify**를 띄우면 스크립트 생존 여부를 시각적으로 확인할 수 있다.
+
+```autohotkey
+SetTimer(() => Notify("스크립트 정상 동작 중"), -200)
+```
+
+MsgBox 닫힌 직후 이 Notify가 보이면 살아있는 것. 안 보이면 네이티브 크래시.
+
+### 진단용 별도 핫키
+
+캡처가 실패할 때 어떤 창들이 잡히는지 확인하는 별도 핫키를 두면 디버깅이 빠르다.
+
+```autohotkey
+^+F9::DiagnoseVSCode()  ; Ctrl+Shift+F9: HWND/크기/클래스/제목 일괄 표시
+```
+
+## 핵심 정리
+
+> **GDI+는 프로세스당 1회 init.** 캡처마다 Startup/Shutdown 반복하면 두 번째 호출에서 네이티브 크래시 → AHK 프로세스가 try/catch 무시하고 즉사한다. `OnExit`에서 1회만 Shutdown하는 패턴을 쓸 것.
+
+다른 두 함정 요약:
+- **UIPI**: 캡처 대상이 admin이면 캡처하는 쪽도 admin이어야 한다. `if !A_IsAdmin → Run('*RunAs ...')` 패턴.
+- **AHK 핫키 ↔ 자기 다이얼로그**: `Esc::ExitApp` 같은 단일 키 종료 핫키는 MsgBox Esc 닫기에 함께 발동. 모디파이어를 추가해 충돌 회피.
+
+PrintWindow의 `PW_RENDERFULLCONTENT(0x2)`는 GPU 가속 앱(Chrome/VSCode 등) 캡처에 필수. 단, 최소화 창(`IsIconic`)은 검게 나오므로 사전 필터링.
