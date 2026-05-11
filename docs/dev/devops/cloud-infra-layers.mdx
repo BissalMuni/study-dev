@@ -1,0 +1,1143 @@
+---
+title: "클라우드 인프라 계층별 역할 — 응용 SW부터 데이터센터까지"
+description: "NHN Cloud(CSAP IaaS) + Kubernetes 환경에서 응용 SW부터 물리 데이터센터까지 10개 계층의 역할·책임 분담을 정리한다. 공공기관 보안성 검토를 위한 책임공유모델 기준."
+category: "dev/devops"
+date: "2026-05-08"
+tags: ["nhn-cloud", "kubernetes", "csap", "spring-boot", "docker", "ha", "load-balancer", "infra"]
+---
+
+# 클라우드 인프라 계층별 역할 — 응용 SW부터 데이터센터까지
+
+NHN Cloud 공공기관용(CSAP IaaS) 환경에서 Spring Boot 애플리케이션을 배포할 때, **응용 SW부터 물리 데이터센터까지 10개 계층**이 어떻게 역할을 분담하는지 정리한 문서. CSAP **책임공유모델** 기준으로 운영기관과 CSP(NHN Cloud)가 무엇을 각각 책임지는지가 핵심.
+
+## 핵심 개념
+
+본 시스템은 **응용 SW부터 물리 데이터센터까지 10개 계층**으로 구성되며, 각 계층의 책임은 **CSAP 책임공유모델**에 따라 운영기관(강남구청)과 CSP(NHN Cloud)가 분담한다.
+
+```
+┌──────────────────────────────────────────────┐
+│  ① 사용자 (직원, 외부 API)                     │  ← 사람·외부 시스템
+├──────────────────────────────────────────────┤
+│  ② 응용 SW (Spring Boot 코드)                 │  🟢 운영기관
+│  ③ JVM (Java 17 런타임)                       │  🟢 운영기관
+│  ④ 컨테이너 (Docker 이미지 인스턴스)           │  🟢 운영기관
+│  ⑤ Pod (K8s 단위)                             │  🟢 운영기관
+├──────────────────────────────────────────────┤
+│  ⑥ Worker Node (VM)                           │  🟡 분담 (NKS 사용 시 NHN ↑)
+├──────────────────────────────────────────────┤
+│  ⑦ Hypervisor (가상화 계층)                   │  🔴 NHN
+│  ⑧ Physical Server (물리 서버)                │  🔴 NHN
+│  ⑨ Network · Storage 백본                    │  🔴 NHN
+│  ⑩ Data Center (건물·전력·냉방)               │  🔴 NHN
+└──────────────────────────────────────────────┘
+
+🟢 운영기관 책임   🟡 분담   🔴 NHN 책임
+```
+
+→ **운영기관 작업의 90% 이상이 ②~⑤ 응용 SW 계층에 집중**된다. 인프라 계층은 NHN의 자동 운영이 주축.
+
+### 책임 분담 요약
+
+| 계층 | 운영기관 담당 작업 | NHN 담당 작업 | 운영 빈도 |
+|------|------|------|------|
+| ① 사용자 | 계정 발급·회수, 권한 부여(RBAC) | - | 인사 발생 시 |
+| ② 응용 SW | 코드 개발, 라이브러리 패치, 시큐어코딩 | - | 상시 |
+| ③ JVM | Dockerfile에 JRE 17 베이스 이미지 지정 | - | 분기 1회 |
+| ④ 컨테이너 | Dockerfile 작성, 이미지 빌드·NCR 푸시 | - | 배포 시 |
+| ⑤ Pod | K8s YAML 작성 (replicas, probe, 자원 한도) | - | 변경 시 |
+| ⑥ Worker Node (NKS) | 사양·개수 결정, 모니터링 임계치 | VM 생성, OS 패치, kubelet, 자동 복구 | 초기 1회 |
+| ⑦ Hypervisor | - | KVM 격리, Live Migration 자동 | - |
+| ⑧ Physical Server | - | 하드웨어 설치·교체, 펌웨어 패치 | - |
+| ⑨ Network·Storage | - | VPC 백본, DDoS 방어, 3중 복제 | - |
+| ⑩ Data Center | - | 출입통제, UPS·발전기, 항온항습 | - |
+| LB / HA | LB 헬스체크 임계치·인증서 등록 | LB 자체 이중화, SLA 99.95% | 인증서 갱신 시 |
+
+---
+
+## 제2부. 응용 SW 계층 (운영기관 책임)
+
+### ① 사용자 (User)
+
+- **무엇인가**: 시스템을 사용하는 사람 또는 외부 시스템
+- **구성**: 일반 직원, 관리자/개발자, 외부 연계 API(법제처, LLM)
+- **보안 통제**: JWT(사용자), SSH+MFA(관리자), API Key(외부 시스템)
+- **책임 주체**: 운영기관 (사용자 계정 관리)
+
+### ② 응용 SW (Spring Boot)
+
+#### Spring Boot 프레임워크
+
+- **한 줄 정의**: Java로 서버를 빠르게 만들 수 있게 해주는 프레임워크
+- **버전**: Spring Boot 3.2.5
+- **공공기관 비중**: 80%+ (eGovFramework 기반)
+
+#### 4대 특징
+
+1. **Auto Configuration**: `pom.xml` 의존성만 넣으면 자동 설정
+2. **Embedded Server**: Tomcat이 JAR에 포함되어 별도 설치 불필요
+3. **Starter**: `starter-web`, `starter-data-jpa` 등 기능별 패키지
+4. **Production-Ready**: 헬스체크, 메트릭, 로그 자동 제공
+
+#### 핵심 어노테이션
+
+| 어노테이션 | 역할 |
+|---------|----|
+| `@SpringBootApplication` | 진입점 |
+| `@RestController` + `@GetMapping` | REST API 메서드 매핑 |
+| `@Service` + `@Transactional` | 비즈니스 로직, 트랜잭션 자동 관리 |
+| `@Repository` (JpaRepository) | DB 접근, 메서드 이름으로 SQL 자동 생성 |
+| `@Entity` + `@Table` | DB 테이블 매핑 |
+| `@Valid` + `@NotNull`, `@Size` | 입력값 자동 검증 |
+| `@PreAuthorize("hasRole('ADMIN')")` | 메서드 수준 인가 |
+
+#### Tomcat 내장 서버
+
+- **한 줄 정의**: Java 웹 서버 — HTTP 요청을 받아 Java 코드(Servlet)에 전달
+- **별도 설치**: 불필요 (`spring-boot-starter-web`이 자동 포함)
+
+```
+[브라우저] → HTTP 요청 (GET /api/ordinances)
+   ↓
+[Tomcat]  ← 포트 8080 리스닝, HTTP 파싱, HttpServletRequest 변환
+   ↓
+[Spring Boot Controller]  ← 비즈니스 로직 실행
+   ↓
+[Tomcat]  ← HttpServletResponse → HTTP 응답 변환
+   ↓
+[브라우저]
+```
+
+```yaml
+# application.yml — Tomcat 튜닝
+server:
+  port: 8080
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 10
+    connection-timeout: 5000ms
+    max-connections: 8192
+  shutdown: graceful   # Pod 종료 시 진행 중 요청 마무리
+```
+
+#### Nginx vs Tomcat
+
+| 항목 | Nginx | Tomcat |
+|----|-------|--------|
+| 카테고리 | 웹 서버 / 리버스 프록시 / LB | Java 애플리케이션 서버 |
+| 언어 | C | Java |
+| 주 용도 | 정적 파일·SSL·프록시·LB | Java 코드 실행 |
+| Java 코드 실행 | 못함 | 가능 |
+| 속도 | 매우 빠름 (수만 동시 연결) | 보통 (스레드 모델) |
+
+일반적인 조합:
+
+```
+[브라우저] → HTTPS → [Nginx] → HTTP → [Tomcat]
+                       ↑                  ↑
+              SSL 종료, LB, 정적 파일    Java 실행
+```
+
+→ 클라우드에서는 **Nginx 자리를 관리형 LB**가 차지하여 운영 부담 감소.
+
+### ③ JVM (Java Virtual Machine)
+
+- **한 줄 정의**: Java 17 코드를 실행하는 가상 머신
+- **버전**: Eclipse Temurin 17 JRE
+- **역할**: `java -jar app.jar` 실행, 메모리 관리(Heap/Metaspace), G1GC, JIT 컴파일
+- **메모리**: 힙 최소 512MB ~ 최대 4GB. Pod 1개당 약 1~2GB 할당
+
+### ④ 컨테이너 (Docker)
+
+- **한 줄 정의**: Docker 이미지에서 실행된 격리된 프로세스
+- **기반 기술**: Linux Namespace + Cgroup
+- **이미지 구성**: Base(`eclipse-temurin:17-jre`) + App(`law-matcher.jar`) + 비-root 사용자(`appuser`)
+- **격리 효과**: 다른 컨테이너의 프로세스·파일 시스템 접근 불가
+
+### ⑤ Pod (Kubernetes)
+
+- **한 줄 정의**: K8s가 관리하는 컨테이너 1개를 감싼 실행 단위
+- **K8s 표준**: 구글이 만든 오픈소스 표준
+- **구성**: 컨테이너 + IP 주소 1개 + 라벨(`app=law-matcher`) + 헬스체크(`/actuator/health`)
+- **자동 기능**: 죽으면 자동 재시작(Self-Healing), 트래픽에 따라 자동 증감(HPA), 무중단 배포(Rolling Update)
+
+#### Pod 생애주기
+
+```
+1. kubectl apply -f deployment.yaml
+       ↓
+2. K8s가 Pod 생성 결정
+       ↓
+3. Worker Node에 컨테이너 이미지 다운로드
+       ↓
+4. 컨테이너 시작 → Spring Boot 부팅
+       ↓
+5. Readiness Probe (/actuator/health/readiness) 통과
+       ↓
+6. Service에서 트래픽 받기 시작
+       ↓
+7. Liveness Probe로 지속 모니터링
+       ↓ (장애 시)
+8. K8s가 자동 재시작 (또는 새 Node로 재배치)
+```
+
+---
+
+## 제3부. 인프라 계층 (NHN 책임·분담)
+
+### ⑥ Worker Node (VM) — 심화
+
+> **Pod이 실제로 돌아가는 가상 서버 1대 = NHN Instance 한 대 = Linux 서버**
+
+```
+┌──────────────────────────────────────────────────────┐
+│  NHN Cloud 데이터센터                                 │
+│                                                       │
+│  ┌── 물리 서버 (256GB RAM, 64 core) ───────────────┐ │
+│  │  Hypervisor (KVM)                              │ │
+│  │  ┌──────────────┐ ┌──────────────┐            │ │
+│  │  │ Worker Node1 │ │ Worker Node2 │            │ │
+│  │  │ (VM, 4vCPU)  │ │ (VM, 4vCPU)  │            │ │
+│  │  │  Pod1 (NKS)  │ │  Pod2 (NKS)  │            │ │
+│  │  └──────────────┘ └──────────────┘            │ │
+│  │  ※ 다른 고객 VM들도 같은 물리 서버에 있음      │ │
+│  └─────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────┘
+```
+
+#### 용어 분해
+
+| 종류 | 역할 | 누가 운영? |
+|----|----|--------|
+| **Master Node (Control Plane)** | K8s 자체 운영. Pod 어디에 띄울지 결정 | NHN (NKS가 자동) |
+| **Worker Node** | 실제로 Pod이 돌아가는 곳. 트래픽 처리. | NHN (Worker도 NKS가 관리) |
+
+- **Node** = K8s 클러스터를 구성하는 서버 1대
+- **VM** = Virtual Machine. NHN Cloud의 IaaS 상품인 **Instance**가 곧 VM
+
+#### Worker Node 내부 구성
+
+```
+[Worker Node 1 (VM)]
+├── 운영체제: Ubuntu 22.04 LTS
+├── 컨테이너 런타임: containerd
+├── kubelet                       ← K8s 명령을 받아 컨테이너 띄우는 에이전트
+├── kube-proxy                    ← 네트워크 라우팅
+└── Pod들 (5~20개)
+```
+
+#### Worker Node 사양 예시
+
+| 항목 | 값 | 비고 |
+|----|----|----|
+| CPU | 4 vCPU | Spring Boot 1~2개 + 여유 |
+| RAM | 8 GB | JVM 힙 2GB + Pod 여유 + OS |
+| Disk | 100 GB SSD | 컨테이너 이미지 캐시 |
+| OS | Ubuntu 22.04 LTS | NHN 기본 이미지 |
+| 개수 | 2~5대 | Auto Scaling |
+
+> **주의**: 보안성검토를 위해선 **동일 서비스 Pod 1·2를 다른 Node에 분산**해야 한다 (한 Node 죽어도 다른 Node에서 살아있도록). K8s `podAntiAffinity` 설정으로 자동 처리.
+
+#### Worker Node 1대가 죽으면
+
+```
+정상 상태:
+[Node 1] Pod-A, Pod-B
+[Node 2] Pod-C, Pod-D
+
+Node 1이 갑자기 죽음:
+[Node 1] ☠️ DOWN
+[Node 2] Pod-C, Pod-D
+
+K8s가 감지 (몇 초 내):
+1. Node 1을 클러스터에서 제외
+2. Pod-A, Pod-B를 다른 Node로 재배치
+3. 필요하면 새 Worker Node를 NHN에서 자동 임차
+
+복구 후:
+[Node 2] Pod-C, Pod-D, Pod-A
+[Node 3] Pod-B  ← 자동 추가됨
+```
+
+→ **사람이 자고 있어도 NHN과 K8s가 알아서 복구**.
+
+#### docker-compose vs Worker Node (NKS)
+
+| 항목 | docker-compose | Worker Node (NKS) |
+|----|--------------|----------------|
+| 서버 | 1대 (Instance) | 여러 대 (자동 증감) |
+| 컨테이너 위치 | 그 서버에 직접 | Pod로 묶여 어느 Node든 |
+| 서버 죽으면 | 서비스 중단 | 자동 복구 |
+| 새 서버 필요 시 | 수동 임차·설정 | 자동 추가 (Cluster Autoscaler) |
+| OS 보안 패치 | 직접 (`apt update`) | NHN 자동 |
+
+### ⑦ Hypervisor
+
+- **무엇인가**: 1대의 물리 서버 위에 여러 VM(Worker Node)을 만들어주는 SW
+- **종류**: NHN Cloud는 자체 Hypervisor 사용 (KVM 기반 추정)
+- **역할**: VM 단위 자원 격리(CPU/RAM/Disk/Network), VM 간 메모리·프로세스 완전 분리, Live Migration
+- **책임 주체**: NHN 100%
+
+### ⑧ Physical Server
+
+- **사양 예시**: AMD EPYC 64코어, RAM 512GB, NVMe SSD 수 TB
+- **공유 방식**: 한 물리 서버에 여러 고객의 VM이 돌아감 (Hypervisor가 격리)
+- **유지보수**: 장애 시 자동으로 다른 물리 서버로 VM 이동, 정기 펌웨어 패치(다운타임 없이)
+
+### ⑨ Network · Storage 백본
+
+- **네트워크**: 내부 100Gbps 백본, 백본 스위치/코어 라우터, DDoS 방어 인프라(L3/L4)
+- **스토리지**: Object Storage 분산 인프라, RDS 백업 저장소, 자동 3중 복제
+- **보안**: VPC 단위 네트워크 격리, 다른 고객의 트래픽이 도달 불가
+
+### ⑩ Data Center
+
+- **위치**: 국내 (CSAP 인증 요건: 한국 영토 내)
+- **물리 보안**: 출입통제(지문·홍채), 24/7 CCTV, 경비 인력 상주
+- **환경 시설**: UPS, 비상 디젤 발전기, 항온·항습(22℃), 화재 진압(가스식)
+
+---
+
+## 제4부. 가용성·부하분산
+
+### Load Balancer (LB)
+
+> **트래픽을 여러 서버에 나누는 장치**
+
+#### 4가지 핵심 기능
+
+**1. 트래픽 분산 (Distribution)** — Round Robin / Least Connections / IP Hash
+
+**2. 헬스 체크 (Health Check)** — HA의 핵심
+
+```
+LB가 5초마다 각 Pod에 핑:
+GET http://Pod1:8080/actuator/health → 200 OK ✅
+GET http://Pod2:8080/actuator/health → 응답 없음 ❌
+
+→ Pod 2를 분산 대상에서 자동 제외
+```
+
+**3. SSL/TLS 종료 (TLS Termination)**
+
+```
+[브라우저] → HTTPS 443 → [LB] → HTTP 80 → [Pod]
+                          ↑
+                     여기서 암호 풀음
+```
+
+→ Pod은 HTTP만 처리, 암호화는 LB가. 인증서 관리도 LB에서만.
+
+**4. 트래픽 라우팅 (Routing)** — 경로별로 다른 Pod 그룹으로 분산.
+
+#### NHN Cloud LB 종류
+
+| 종류 | 용도 |
+|----|----|
+| **Application LB (ALB)** | HTTP/HTTPS, L7 라우팅 — 권장 |
+| **Network LB (NLB)** | TCP/UDP, L4 분산, 고성능 |
+| **Classic LB** | 단순 L4, 레거시 |
+
+### High Availability (HA)
+
+> **장애가 발생해도 서비스가 계속 가능한 상태**
+
+목표: **연 99.95% 이상 가동** (= 연 4.4시간 미만 다운타임)
+
+#### HA의 3대 요소
+
+```
+1. 이중화 (Redundancy)        → Pod 2개 이상
+2. 자동 감지 (Detection)       → LB의 헬스 체크
+3. 자동 인계 (Failover)        → 죽은 Pod 제외 + K8s 자동 재시작
+```
+
+#### HA 자동 동작 시나리오
+
+```
+[정상 상태]
+[LB] → [Pod 1 ✅] [Pod 2 ✅]   50% / 50%
+
+[Pod 1 죽음 — 새벽 3시]
+[LB] → [Pod 1 ☠️] [Pod 2 ✅]
+   ↓ 헬스체크 5초마다 확인
+   ↓ Pod 1 응답 없음 감지
+   ↓ 자동으로 Pod 1 제외
+[LB] → [Pod 2 ✅]   100%
+
+[K8s가 Pod 1 자동 재시작]
+[LB] → [Pod 1 ✅ 부활] [Pod 2 ✅]
+```
+
+→ **사람이 자고 있어도 LB + K8s가 알아서**: 이게 **"자동 HA"**.
+
+#### 본 프로젝트의 HA 구성요소
+
+| 계층 | HA 방법 |
+|----|----|
+| LB | NHN Cloud LB 자체 이중화 (NHN 책임) |
+| App (Pod) | Pod 2~5개 + LB 헬스체크 |
+| Worker Node | NKS가 여러 Node에 Pod 분산 |
+| DB | RDS HA (Active-Standby) |
+| Redis | Memorystore HA |
+| Object Storage | NHN 자동 3중 복제 |
+| 데이터센터 | NHN 다중 AZ (선택) |
+
+→ **모든 계층이 이중화**, 어느 하나가 죽어도 서비스 계속.
+
+---
+
+## 제5부. 운영·관리 도구
+
+### NHN Cloud 콘솔 (GUI)
+
+| 메뉴 | 작업 |
+|----|----|
+| Compute → Instance | VM 생성·삭제·시작·정지 |
+| Container → NKS | K8s 클러스터 생성·노드 관리 |
+| Container → NCR | Docker 이미지 저장소 |
+| Database → RDS | PostgreSQL 인스턴스 관리 |
+| Network → Load Balancer | LB 설정 |
+| Network → Security Group | 방화벽 룰 |
+| Security → App Security | WAF 룰 |
+
+→ **클릭 몇 번으로 인프라 구성 가능**, 운영 인력 적은 공공기관에 적합.
+
+### NHN CLI / API / Terraform
+
+```hcl
+# Terraform 예시 (IaC)
+resource "nhncloud_compute_instance" "law_matcher_web" {
+  name = "law-matcher-web1"
+  flavor_id = "u2.c4m8"  # 4vCPU 8GB
+  image_id = "ubuntu-22.04"
+  count = 2
+}
+```
+
+| 도구 | 추천 상황 |
+|----|--------|
+| 콘솔 (GUI) | **초기 구축, 일회성** |
+| CLI | 정기 점검, 백업 스크립트 |
+| Terraform | 운영 안정화 후 (재현 가능, Git 추적) |
+| REST API | 커스텀 자동화 |
+
+### kubectl (K8s CLI)
+
+> **K8s 클러스터를 명령어로 조작하는 CLI 도구** (발음: "큐브 컨트롤")
+
+```bash
+# 조회
+kubectl get nodes              # Worker Node 목록
+kubectl get pods               # Pod 목록
+kubectl describe pod <name>    # 자세한 정보
+
+# 로그 / 디버깅
+kubectl logs <pod-name>
+kubectl logs -f <pod-name>     # 실시간
+kubectl exec -it <pod> -- bash # Pod 안에 들어가기
+
+# 배포
+kubectl apply -f deployment.yaml
+kubectl set image deployment/law-matcher app=ncr.gov-ntruss.com/law-matcher:1.1
+kubectl rollout status deployment/law-matcher
+kubectl rollout undo deployment/law-matcher  # 롤백
+
+# 자원
+kubectl scale deployment law-matcher --replicas=5
+kubectl top pods
+```
+
+#### 콘솔 vs kubectl
+
+| 작업 | 추천 |
+|----|----|
+| 클러스터 생성 | NHN 콘솔 |
+| 일상 배포 | **kubectl** |
+| Pod 로그/디버깅 | **kubectl** |
+| 자원 확장 (Worker Node) | NHN 콘솔 |
+| 보안그룹 변경 | NHN 콘솔 |
+| 자동화 스크립트 | **kubectl** |
+
+→ **둘 다 쓰는 게 일반적**. 콘솔은 인프라 변경, kubectl은 애플리케이션 운영.
+
+#### kubectl 보안 주의사항
+
+| 항목 | 주의사항 |
+|----|------|
+| kubeconfig 파일 | 절대 외부 노출 금지 (Git 커밋 X) |
+| 접근 IP 제한 | NKS API Server 접근 IP 제한 |
+| RBAC | 사용자별 권한 분리 (개발자=읽기, 운영자=배포) |
+| MFA | NHN 계정 자체에 MFA 적용 |
+
+---
+
+## 제6부. 데이터 흐름
+
+### 일반 사용자 요청
+
+```
+[사용자 PC]
+   ↓ HTTPS (TLS 1.2+)
+[App Security (WAF)]   ← OWASP 룰로 공격 차단
+   ↓
+[Load Balancer]        ← 트래픽 분산, TLS 종료
+   ↓
+[Spring Boot Pod]
+  ├─ [Tomcat]          ← HTTP → Java 객체 변환
+  ├─ [Controller]      ← @RequestMapping, JWT 검증
+  ├─ [Service]         ← 비즈니스 로직
+  ├─ [Repository]      ← JPA QueryDSL
+   ↓ JDBC (TLS)
+[RDS for PostgreSQL]
+   ↓
+[블록 스토리지 (암호화)] ← NHN 관리
+   ↓
+[물리 SSD]             ← NHN 데이터센터
+```
+
+### 외부 API 호출
+
+```
+[Spring Boot Pod]
+   ↓ HTTPS 외부망 호출
+[NAT Gateway / Egress]  ← VPC에서 외부 인터넷으로 나가는 게이트웨이
+   ↓
+[법제처 Open API]       ← https://www.law.go.kr
+   ↓ XML 응답
+[Spring Boot Pod] → [RDS]
+```
+
+### 관리자 접속 — Bastion Host(점프 서버)
+
+```
+[관리자 PC]  ━━X━━  [Spring Boot Pod]   ← 직접 접속 불가
+[관리자 PC]  ━━X━━  [PostgreSQL DB]      ← 직접 접속 불가
+
+[관리자 PC]  ──→  [Bastion Host]  ──→  [Spring Boot Pod / DB]
+                       ↑
+                  여기서 한 번 "점프"
+```
+
+| 용어 | 강조점 | 사용처 |
+|------|------|------|
+| **Bastion Host** | 보안 요새(Bastion=요새) | AWS, NHN Cloud 공식 문서 |
+| **점프 서버 (Jump Server)** | 거쳐 가는 중간 서버 | 한국 SI/공공기관 |
+| **Jump Box** | 영문 별칭 | 외국 인프라 문서 |
+| **Stepping Stone** | 디딤돌 | 일본·중국권 |
+
+→ **모두 같은 것**.
+
+#### Bastion Host의 핵심 보안 효과
+
+| 효과 | 설명 |
+|------|------|
+| 공격 표면 축소 | 운영 서버는 인터넷에서 안 보임 → 직접 공격 불가 |
+| 단일 진입점 | 모든 관리 트래픽이 한 곳을 지남 → 감사 로그 집중 |
+| 강한 인증 적용 | Bastion에만 MFA·OTP 적용해도 모든 운영 서버 보호 |
+| 계정 분리 | Bastion 계정 ≠ 운영 서버 계정 |
+
+→ Bastion 없으면 운영 서버가 매일 수만 건의 SSH 무차별 공격을 직접 받음. 행안부 시큐어코딩 **A07(인증·권한관리)**, **A09(로깅·모니터링)**과 직결.
+
+---
+
+## 제7부. 보안성 검토 자주 묻는 Q&A
+
+### Q1. "Pod는 NHN이 만들어 주는 건가요?"
+
+> Pod는 K8s 표준 개념으로, NHN이 아닌 구글이 만든 오픈소스 표준이다. 운영기관이 K8s YAML 명세에 Pod를 정의하고, NHN이 운영하는 NKS(NHN Kubernetes Service) 환경에서 자동 실행된다. **Pod 명세는 운영기관, Pod 실행 환경은 NHN**으로 책임이 분담된다.
+
+### Q2. "서버 보안 패치는 누가 하나요?"
+
+- **응용 SW의 라이브러리 패치**: 운영기관 (의존성 업데이트)
+- **컨테이너 베이스 이미지 패치**: 운영기관 (Dockerfile의 base image 갱신)
+- **Worker Node OS 패치**: NHN (NKS가 자동)
+- **Hypervisor·물리 서버 패치**: NHN 100%
+
+### Q3. "데이터센터에 직접 점검할 수 있나요?"
+
+> CSAP 인증 데이터센터의 출입통제 정책상 직접 출입은 불가. 대신 **CSAP 인증서**(NHN이 KISA로부터 받음)로 물리 보안 통제가 검증되어 있으며, NHN의 정기 보안 감사 보고서를 통해 점검 결과를 확인할 수 있다.
+
+### Q4. "해킹당하면 누구 책임인가요?"
+
+- 응용 SW 취약점(SQL Injection 등): 운영기관 책임
+- OS 취약점·Hypervisor 탈출: CSP(NHN) 책임
+- 계정 탈취 (피싱): MFA 미적용 시 운영기관 책임
+
+### Q5. "HA는 어떻게 보장하나요?"
+
+- **이중화**: Pod 최소 2개, 최대 5개 Auto Scaling
+- **헬스 체크**: NHN LB가 5초 간격 `/actuator/health` 호출
+- **자동 인계**: 헬스 체크 3회 실패 시 분산 대상 제외
+- **자동 복구**: NKS가 죽은 Pod 자동 재시작 (RTO 5초 이내)
+- **SLA**: NHN Cloud LB 99.95%
+
+### Q6. "Spring Boot, Tomcat, Nginx의 관계는?"
+
+- **Spring Boot**: Java 웹 서버 프레임워크 (응용 SW)
+- **Tomcat**: Spring Boot에 내장된 Java Servlet 컨테이너 (HTTP 처리)
+- **Nginx**: docker-compose 환경에서는 LB·SSL 종료 역할이지만, NHN Cloud 배포 시 **NHN 관리형 LB**가 대체 → Nginx 컨테이너 제거
+
+---
+
+## 부록 A. 약어 사전
+
+| 용어 | 풀이 | 설명 |
+|------|------|------|
+| CSAP | Cloud Security Assurance Program | 한국인터넷진흥원 클라우드 보안인증제 |
+| CSP | Cloud Service Provider | 클라우드 서비스 제공자 |
+| VPC | Virtual Private Cloud | 가상 사설 클라우드 |
+| K8s | Kubernetes | 컨테이너 자동 관리 시스템 |
+| NKS | NHN Kubernetes Service | NHN 관리형 K8s 서비스 |
+| HA | High Availability | 고가용성 |
+| LB | Load Balancer | 트래픽 분산 |
+| ALB / NLB | Application / Network LB | L7 / L4 LB |
+| WAF | Web Application Firewall | 웹 응용 방화벽 |
+| MFA | Multi-Factor Authentication | 다중 요소 인증 |
+| TLS | Transport Layer Security | 전송 계층 보안 |
+| JWT | JSON Web Token | 토큰 기반 인증 표준 |
+| RDS | Relational Database Service | 관리형 관계형 DB |
+| HPA | Horizontal Pod Autoscaler | 수평 Pod 자동 확장 |
+| RTO / RPO | Recovery Time / Point Objective | 복구 목표 시간/시점 |
+| NCR | NHN Container Registry | Docker 이미지 저장소 |
+| JVM / JRE | Java Virtual Machine / Runtime Env | 자바 실행 환경 |
+| IaC | Infrastructure as Code | 인프라 코드화 |
+| RBAC | Role-Based Access Control | 역할 기반 접근 제어 |
+| SLA | Service Level Agreement | 서비스 수준 협약 |
+| KVM | Kernel-based Virtual Machine | 리눅스 기반 Hypervisor |
+| OWASP | Open Worldwide App Security Project | 웹 보안 표준 단체 |
+| NAT | Network Address Translation | 네트워크 주소 변환 |
+| SSRF | Server-Side Request Forgery | 서버 측 요청 위조 |
+
+---
+
+## 부록 B. 자주 묻는 기술 용어 상세
+
+> 본문에 등장한 약어·기술 용어 중 **독립적 개념**(어원/구조/대안 비교가 가능한 것)만 상세히 풀어 쓴다. YAML 키워드나 어노테이션 같은 단순 설정 필드는 본문 인라인 설명에 그친다.
+
+### B.1 YAML
+
+```
+YAML = YAML Ain't Markup Language
+       (YAML은 마크업 언어가 아니다)
+```
+
+→ **재귀적 약어**. 원래 *Yet Another Markup Language* 였다가 "마크업이 아닌 데이터 직렬화 형식"을 강조하기 위해 변경.
+
+**무엇인가**: 사람이 읽기 쉬운 데이터 표현 형식 (JSON·XML과 같은 카테고리). K8s, Docker Compose, Spring Boot, GitHub Actions 등 **설정 파일의 사실상 표준**.
+
+```yaml
+# YAML — 들여쓰기로 구조 표현
+name: law-matcher
+replicas: 2
+labels:
+  app: law-matcher
+  env: prod
+```
+
+```json
+// JSON — 중괄호·쉼표
+{
+  "name": "law-matcher",
+  "replicas": 2,
+  "labels": { "app": "law-matcher", "env": "prod" }
+}
+```
+
+→ **YAML이 가장 간결**하지만 **들여쓰기에 매우 민감** (스페이스 vs 탭, 정확한 칸 수). 잘못 쓰면 파싱 에러.
+
+### B.2 KVM (Hypervisor)
+
+```
+KVM = Kernel-based Virtual Machine
+      (커널 기반 가상 머신)
+```
+
+**Linux 커널에 내장된 가상화 기술**. Hypervisor의 한 종류.
+
+```
+┌─────────────────────────────────┐
+│ Worker Node (VM) ⑥              │
+├─────────────────────────────────┤
+│ KVM (Hypervisor) ⑦              │  ← 이게 KVM
+├─────────────────────────────────┤
+│ Linux 커널 (호스트 OS)          │
+├─────────────────────────────────┤
+│ Physical Server ⑧               │
+└─────────────────────────────────┘
+```
+
+| Hypervisor | 만든 곳 | 라이센스 |
+|---------|------|------|
+| **KVM** | Red Hat | 오픈소스 |
+| VMware ESXi | VMware | 유료 |
+| Hyper-V | Microsoft | Windows 포함 |
+| Xen | Citrix | 오픈소스 |
+
+→ 대부분의 클라우드 회사가 **KVM 또는 Xen 기반**으로 자체 Hypervisor 구축.
+
+### B.3 WAF + OWASP
+
+#### WAF — Web Application Firewall
+
+웹 공격을 차단하는 전문 방화벽. 일반 방화벽(IP·포트 기반)과 달리 **HTTP 요청 내용을 분석**하여 공격 차단.
+
+#### OWASP — Open Worldwide Application Security Project
+
+**웹 보안 표준을 만드는 비영리 단체** (2001~). 가장 유명한 산출물: **OWASP Top 10**.
+
+| # | 항목 | 예시 |
+|---|----|----|
+| 1 | Broken Access Control | 권한 없는 페이지 접근 |
+| 2 | Cryptographic Failures | 약한 암호화·평문 전송 |
+| 3 | Injection | `' OR 1=1 --` |
+| 4 | Insecure Design | 설계 단계 결함 |
+| 5 | Security Misconfiguration | 디폴트 비밀번호 |
+| 6 | Vulnerable Components | 오래된 라이브러리 |
+| 7 | Identification & Authentication Failures | 약한 비밀번호 정책 |
+| 8 | Software & Data Integrity Failures | 무결성 검사 없음 |
+| 9 | Security Logging & Monitoring Failures | 로그 부재 |
+| 10 | Server-Side Request Forgery (SSRF) | 서버에서 공격자 요청 강제 |
+
+→ 행안부 시큐어코딩 49항도 OWASP Top 10 기반.
+
+```
+[공격자] → POST /api/login {"username": "admin' OR 1=1 --"}
+   ↓
+[WAF]
+   ├─ OWASP Core Rule Set (CRS) 검사
+   ├─ "OR 1=1" 패턴 발견 → SQL Injection 시도!
+   └─ 403 Forbidden 응답, 차단
+```
+
+### B.4 JPA + QueryDSL (Repository 계층)
+
+#### Repository — DB 접근 계층
+
+```
+[Controller] → [Service] → [Repository] → [Database]
+```
+
+#### JPA — Java Persistence API
+
+**Java 객체를 DB 테이블과 매핑하는 표준 명세**. 직접 SQL을 안 쓰고 Java 코드로 DB 조작.
+
+```java
+// Before JPA (순수 JDBC)
+String sql = "SELECT id, name FROM ordinance WHERE id = ?";
+PreparedStatement ps = connection.prepareStatement(sql);
+ps.setLong(1, 100);
+ResultSet rs = ps.executeQuery();
+while (rs.next()) {
+    Ordinance o = new Ordinance();
+    o.setId(rs.getLong("id"));
+    o.setName(rs.getString("name"));
+}
+```
+
+```java
+// After JPA (Spring Data JPA)
+public interface OrdinanceRepository extends JpaRepository<Ordinance, Long> {
+    List<Ordinance> findByName(String name);
+    Optional<Ordinance> findByIdAndStatus(Long id, String status);
+}
+
+Ordinance o = ordinanceRepository.findById(100L).orElseThrow();
+```
+
+→ SQL 안 짜고 **메서드 이름만으로 쿼리 생성**.
+
+#### QueryDSL — Type-safe SQL builder
+
+JPA의 한계: **복잡한 동적 쿼리는 어려움**. QueryDSL은 이를 **타입세이프한 Java 코드로**:
+
+```java
+public List<Ordinance> search(String name, String status) {
+    return queryFactory
+        .selectFrom(ordinance)
+        .where(
+            nameContains(name),     // null이면 무시
+            statusEq(status)
+        )
+        .fetch();
+}
+
+private BooleanExpression nameContains(String name) {
+    return name == null ? null : ordinance.name.contains(name);
+}
+```
+
+→ **컴파일 시점에 SQL 오류 검출**, IDE 자동완성 지원.
+
+| 용도 | 도구 |
+|----|----|
+| 단순 CRUD (`findById`, `save`) | **Spring Data JPA** |
+| 메서드 이름 쿼리 (`findByName`) | **Spring Data JPA** |
+| 복잡한 동적 검색·페이징 | **QueryDSL** |
+| 통계 쿼리·서브쿼리 | **QueryDSL** |
+
+| 방식 | SQL Injection 방어 |
+|----|----------------|
+| 순수 JDBC | `PreparedStatement` 직접 사용 (실수 가능) |
+| **JPA `@Param`** | 자동 파라미터 바인딩 |
+| **QueryDSL** | 타입세이프, SQL 직접 생성 안 함 |
+
+### B.5 NAT Gateway / Egress
+
+```
+NAT = Network Address Translation
+      (네트워크 주소 변환)
+```
+
+**여러 내부 IP를 하나의 외부 IP로 변환**해주는 기술. NAT Gateway = VPC에서 외부 인터넷으로 나갈 때 사용하는 **단일 출구**.
+
+#### 왜 필요한가
+
+```
+[VPC 내부]
+├── Pod 1 (10.0.1.10) ─┐
+├── Pod 2 (10.0.1.11) ─┤
+└── Pod 3 (10.0.1.12) ─┤
+                       ↓
+              [NAT Gateway]   ← 모든 Pod의 출구
+              Public IP: 203.0.113.5
+                       ↓
+                  [인터넷] → [법제처 Open API]
+                       "203.0.113.5에서 요청 옴"
+                       ↓
+              [NAT Gateway]   ← 어느 Pod이 보냈는지 추적
+                       ↓
+              [Pod 1] ← 정확히 보낸 Pod에 전달
+```
+
+| 용어 | 의미 |
+|----|----|
+| **Ingress** | 외부 → 내부 (들어옴) |
+| **Egress** | 내부 → 외부 (나감) |
+
+→ NAT Gateway는 **IP 숨김**, **방화벽 화이트리스트 단순화**, **로그 단순화** 효과.
+
+### B.6 MFA — 인증의 3대 요소
+
+```
+MFA = Multi-Factor Authentication
+      (다중 요소 인증)
+```
+
+→ **Multi**는 라틴어 *multus*(많은)에서 온 접두사로 "**둘 이상의·여러 개의**"를 의미. **Factor**는 "본인 확인 수단(요소)". 즉 MFA = "**서로 다른 종류의 본인 확인 수단을 2개 이상 조합**".
+
+#### 인증의 3대 요소(Factor)
+
+| 요소 | 영문 | 설명 | 예시 |
+|------|------|------|------|
+| **지식 요소** | Something you **know** | 본인만 아는 것 | 비밀번호, PIN, 보안 질문 |
+| **소유 요소** | Something you **have** | 본인만 가진 것 | OTP 앱, SMS 코드, USB 보안키 |
+| **생체 요소** | Something you **are** | 본인의 신체 특징 | 지문, 얼굴인식, 홍채 |
+
+→ MFA는 **서로 다른 종류 2개 이상**을 요구. 같은 종류 2개(비밀번호 + PIN)는 **MFA가 아님**.
+
+```
+[비밀번호만]            → 1단계 = SFA (Single-Factor)
+[비밀번호 + OTP]         → 2단계 = 2FA (Two-Factor)
+[비밀번호 + OTP + 지문]  → 3단계 = 3FA
+```
+
+→ 2FA, 3FA를 모두 통칭해서 **MFA**. MFA ⊇ 2FA.
+
+#### OTP — One-Time Password
+
+**30초마다 자동으로 바뀌는 6자리 숫자 비밀번호**. 한 번 사용하면 끝, 재사용 불가. 서버와 사용자 기기가 **공유한 비밀키 + 현재 시각**을 알고리즘(TOTP, RFC 6238)으로 계산.
+
+```
+[등록 시 1회] 서버가 QR 코드 표시 → 사용자 앱이 비밀키 저장
+
+[로그인 시 매번]
+  서버:    비밀키 + 현재 시각 → 알고리즘 → 123456
+  사용자:  비밀키 + 현재 시각 → 알고리즘 → 123456   ← 같은 값
+                                              ↓
+                                    사용자 입력 → 일치 → 통과
+```
+
+→ **인터넷 없이도 동작**. SMS OTP보다 안전 — SIM 스와핑 공격 차단.
+
+### B.7 Spring Boot — 왜 "Boot"인가
+
+```
+Spring Boot = Spring + Boot(strap)
+              (스프링 프레임워크 + 부트스트래핑/즉시 시동)
+```
+
+→ **Boot**은 *Bootstrap*의 줄임말. 컴퓨터를 켜면 OS가 자동으로 올라오는 것처럼, **"명령어 한 줄로 즉시 서버가 부팅되어 실행된다"**는 의미.
+
+#### Before Spring Boot (2003~2013, 순수 Spring)
+
+```xml
+<!-- web.xml — Servlet 등록 -->
+<servlet>
+  <servlet-name>dispatcher</servlet-name>
+  <servlet-class>org.springframework.web.servlet.DispatcherServlet</servlet-class>
+</servlet>
+
+<!-- applicationContext.xml — Bean 수동 등록 -->
+<bean id="dataSource" class="...">
+  <property name="url" value="..."/>
+  ...수십 줄...
+</bean>
+```
+
+- XML 설정 파일 **수백 줄** 작성 필요
+- Tomcat **별도 설치** 후 WAR 배포
+- 신규 인력 환경 세팅 **2~3일** 소요
+
+#### After Spring Boot (2014~)
+
+```java
+@SpringBootApplication
+public class LawMatcherApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(LawMatcherApplication.class, args);
+    }
+}
+```
+
+- XML 설정 **0줄** (어노테이션 + `application.yml`로 대체)
+- Tomcat **JAR에 내장** → `java -jar app.jar`만으로 실행
+- 환경 세팅 **30분**
+
+→ **"Boot"가 의미하는 것**: 부팅 버튼 한 번에 OS가 뜨듯, `main()` 호출 한 번에 웹 서버까지 즉시 가동.
+
+#### Production-Ready (Actuator)
+
+```
+[Actuator 엔드포인트 — 별도 코드 없이 자동 제공]
+GET /actuator/health      → Pod liveness probe에 사용
+GET /actuator/metrics     → Prometheus 모니터링
+GET /actuator/info        → 빌드 버전·Git 커밋 해시
+```
+
+→ K8s `livenessProbe`/`readinessProbe`가 `/actuator/health`를 호출하여 Pod 상태 자동 판단.
+
+### B.8 kubelet — Worker Node의 K8s 에이전트
+
+```
+kubelet = kube + -let
+          (K8s + 작은 것/하수인)
+```
+
+→ "piglet=새끼돼지", "booklet=작은 책" 처럼 **`-let`은 작은/하급 단위**를 뜻하는 영어 접미사.
+
+**한 줄 정의**: 각 Worker Node에 1개씩 설치되어, Master Node의 명령을 받아 실제로 컨테이너를 띄우고 관리하는 에이전트.
+
+```
+[관리자] → kubectl apply -f deployment.yaml
+   ↓
+[Master Node (Control Plane)]
+   │ "Worker Node A에 Pod 1개 띄워라"
+   ↓ (gRPC)
+[Worker Node A 의 kubelet]
+   ├─ ① containerd에 명령
+   ├─ ② 컨테이너 이미지 pull (NCR에서)
+   ├─ ③ 컨테이너 시작
+   ├─ ④ probe 주기 호출 (살아있는지 검사)
+   └─ ⑤ 상태를 Master에 보고 (heartbeat)
+```
+
+#### kubelet vs kubectl — 헷갈리지 말 것
+
+| 이름 | 역할 | 위치 | 누가 사용 |
+|------|------|------|------|
+| **kubectl** | K8s에 명령을 내리는 **CLI 도구** | 관리자 PC / Bastion | 사람 |
+| **kubelet** | 명령을 받아 **컨테이너를 실제로 띄우는 에이전트** | 모든 Worker Node | K8s 시스템 (자동) |
+
+→ 사람이 만지는 건 **kubectl**, 자동으로 도는 건 **kubelet**.
+
+### B.9 VPC 백본 — 클라우드 내부 고속 네트워크
+
+```
+VPC = Virtual Private Cloud (가상 사설 클라우드)
+백본 = Backbone Network (등뼈/척추 네트워크)
+```
+
+→ **VPC** = 클라우드 안에 만든 전용 가상 네트워크
+→ **백본** = 사람의 척추(Backbone)처럼 **모든 트래픽이 지나는 중심 고속 네트워크**
+
+```
+[일반 네트워크 = 거리의 골목길]   ← 100Mbps~1Gbps
+[백본 네트워크 = 고속도로]         ← 100Gbps~400Gbps (1000배+)
+```
+
+```
+┌─ NHN 평촌 데이터센터 ─────────────────┐
+│  [고객사 A VPC]   [고객사 B VPC]      │
+│       │                │              │
+│       └─── VPC 백본 ───┘              │  ← NHN이 운영 (100Gbps급)
+│              │                        │
+│       [NHN 공통 서비스]                │
+│       (RDS, K8s API, NCR 등)          │
+└──────┬────────────────────────────────┘
+       │ DC 간 백본 (전용 광케이블)      ← 이중화
+┌──────┴────────────────────────────────┐
+│  NHN 판교 데이터센터 (재해복구용 DR)   │
+└───────────────────────────────────────┘
+```
+
+#### 백본이 해결하는 4가지
+
+| 문제 | 백본의 해결 |
+|------|------|
+| **속도** | Pod ↔ DB 통신을 100Gbps 백본으로 µs 응답 |
+| **격리** | 고객사 간 트래픽이 백본 위에서 VLAN/오버레이로 분리 |
+| **가용성** | 백본 자체 이중화·다중 경로 → 1개 회선 끊겨도 무중단 |
+| **DDoS 방어** | 백본 진입점에서 대용량 공격 흡수·필터링 |
+
+### B.10 `kubectl apply` 흐름 — YAML 적용 요청 전체 추적
+
+```bash
+$ kubectl apply -f deployment.yaml
+deployment.apps/law-matcher created
+```
+
+이 한 줄 뒤에 **클러스터 전체의 협업**이 일어난다.
+
+#### 핵심 개념 — Desired State (선언형)
+
+```
+[전통 명령형]                    [K8s 선언형]
+"Pod 1개 만들어"                 "Pod 2개 있어야 함" (목표만 선언)
+"또 1개 만들어"                  → K8s가 알아서 차이를 메움
+"하나 죽었네, 다시 만들어"
+```
+
+→ `apply` = **"이 YAML이 원하는 상태(desired state)다, 알아서 맞춰라"**. K8s 컨트롤러들이 **현재 상태**와 끊임없이 비교해서 자동 수렴.
+
+#### 단계별 흐름
+
+```
+[① Bastion Host에서 kubectl 실행]
+   YAML 파일 읽음 → JSON 변환
+   HTTPS POST 요청 (mTLS 인증서 + 토큰)
+       ↓
+[② Master Node — API Server (kube-apiserver)]
+   ② -1. 인증 (Authentication)       — 인증서·토큰 검증
+   ② -2. 인가 (Authorization, RBAC)  — 권한 확인
+   ② -3. Admission Control          — 정책 위반 검사
+   ② -4. etcd에 저장 (영구 기록)     — desired state 기록
+       ↓
+[③ Master Node — Controller Manager]
+   Deployment Controller가 변화 감지
+   "현재 Pod 0개, 원하는 건 2개 → 2개 만들어야 함"
+   → ReplicaSet 생성 → Pod 2개 생성 요청
+       ↓
+[④ Master Node — Scheduler (kube-scheduler)]
+   ├─ Filtering: 자원 충분한 노드 후보
+   ├─ Scoring: 부하 분산·affinity 점수
+   └─ 결정: Pod1 → Node A, Pod2 → Node B
+       ↓
+[⑤ Worker Node A 의 kubelet]
+   ⑤ -1. 컨테이너 이미지 pull (NCR에서)
+   ⑤ -2. containerd가 컨테이너 시작
+   ⑤ -3. CNI 플러그인이 Pod IP 할당
+   ⑤ -4. probe 시작 → /actuator/health 호출
+   ⑤ -5. 상태 보고 → API Server → etcd
+       ↓
+[⑥ Service / LB가 자동 인식]
+   readinessProbe 성공 Pod만 Service endpoint 등록
+   외부 트래픽이 새 Pod로 흐르기 시작
+       ↓
+[⑦ kubectl 응답] "deployment.apps/law-matcher created"
+```
+
+#### `apply` vs `create`
+
+| 명령 | 동작 | 두 번째 실행 시 |
+|------|------|------|
+| `kubectl create -f file.yaml` | 새로 만들기 | "이미 있다" 에러 |
+| `kubectl apply -f file.yaml` | **있으면 변경, 없으면 생성** | 변경된 부분만 패치 |
+
+→ 운영에서는 **항상 `apply`** 사용.
+
+#### 트러블슈팅 가이드
+
+| 실패 단계 | 증상 | 진단 명령 | 책임 영역 |
+|------|------|------|------|
+| ② 인증 실패 | `Unauthorized` | `kubectl config view` | 운영기관 (kubeconfig) |
+| ② 인가 실패 | `forbidden: ... cannot create` | RBAC 권한 확인 | 운영기관 |
+| ② Admission 실패 | `denied by ...` | 정책 위반 메시지 | 운영기관 (YAML 수정) |
+| ④ Scheduler 실패 | Pod이 `Pending` | `kubectl describe pod` | 자원 부족=NHN, 정책=운영기관 |
+| ⑤ 이미지 pull 실패 | `ImagePullBackOff` | 이미지 이름·NCR 자격증명 | 운영기관 |
+| ⑤ 컨테이너 시작 실패 | `CrashLoopBackOff` | `kubectl logs` 앱 로그 | 운영기관 (응용 SW) |
+| ⑤ probe 실패 | `Running`이지만 `0/1 Ready` | `/actuator/health` 응답 | 운영기관 |
+
+→ **거의 모든 운영 트러블슈팅은 ⑤ Worker Node·kubelet 단계에서 발생**. ②④는 인프라(NHN), ⑤는 응용 SW(운영기관) 영역.
+
+### B.11 Servlet — Java 표준 HTTP 처리 객체
+
+```
+Servlet = Server + -let
+          (서버 + 작은 것)
+```
+
+→ "Applet"(브라우저에서 도는 작은 자바 프로그램)의 반대 개념. **서버 쪽에서 도는 작은 자바 프로그램**.
+
+**한 줄 정의**: HTTP 요청을 Java 객체로 받아 응답을 돌려주는 **Java 표준 명세** (Java EE → Jakarta EE).
+
+```
+[브라우저] → HTTP 요청
+   ↓
+[Tomcat (Servlet Container)]   ← Servlet을 실행해주는 환경
+   │  HTTP 메시지 → HttpServletRequest 객체로 변환
+   ↓
+[Servlet 객체]                 ← 여기서 실제 처리
+   │  (Spring Boot에서는 DispatcherServlet 1개가
+   │   모든 요청 받아 Controller로 분배)
+   ↓
+[HttpServletResponse 객체] → HTTP 응답으로 변환
+   ↓
+[브라우저]
+```
+
+#### Spring Boot에서의 Servlet
+
+직접 Servlet 작성할 일은 거의 없음. **Spring MVC가 `DispatcherServlet` 하나로 모든 요청을 받고**, `@RestController` 메서드로 분배.
+
+```
+[모든 HTTP 요청]
+   ↓
+[DispatcherServlet]   ← 단 1개의 Servlet (Spring 제공)
+   ↓ URL 매칭
+[OrdinanceController.list()]   ← @GetMapping("/api/ordinances")
+[OrdinanceController.detail()]
+```
+
+| 항목 | Servlet (순수) | Spring Controller |
+|------|------|------|
+| 요청 받기 | `doGet(req, resp)` 직접 작성 | `@GetMapping` 어노테이션 |
+| 파라미터 추출 | `req.getParameter("id")` | `@RequestParam Long id` |
+| 응답 작성 | `resp.getWriter().write(...)` | `return dto;` (자동 JSON) |
+| 코드량 | 많음 | 적음 |
+
+→ Spring Controller는 **Servlet을 한 단계 더 추상화**. 내부적으로는 여전히 Servlet 위에서 동작.
+
+---
+
+## 핵심 정리
+
+> **클라우드 인프라는 10개 계층의 책임 분담이 핵심**.
+> 운영기관(고객)은 **②~⑤ 응용 SW 계층(Spring Boot, JVM, 컨테이너, Pod)에 작업의 90%가 집중**되며, 그 아래 **⑥~⑩ 인프라 계층은 CSP(NHN)가 자동 운영**한다. CSAP 책임공유모델을 이해하면 보안성 검토에서 "이건 누구 책임인가요?"라는 질문에 정확히 답할 수 있다.
+
+### 학습 권장 순서
+
+| 단계 | 학습 주제 |
+|----|--------|
+| 1 | Java 기본 문법 + JDK 설치 |
+| 2 | Spring Boot 프레임워크 기본 |
+| 3 | JPA + Spring Data |
+| 4 | Tomcat 내장 서버 이해 |
+| 5 | Spring Security + JWT |
+| 6 | Docker / 컨테이너 |
+| 7 | Kubernetes 기초 (Pod, Service) |
+| 8 | Worker Node + NKS |
+| 9 | Load Balancer + HA |
+| 10 | NHN Cloud 콘솔 + kubectl |
+| 11 | CSAP 책임공유모델 |
+| 12 | 보안성 검토 답변 |
