@@ -153,3 +153,7 @@ Claude Code가 실행 시 hang 걸리면 다음 순서로:
 ## 핵심 정리
 
 > **디버그 로그가 끊긴 지점이 hang 원인이다.** Claude Code는 `~/.claude/debug/latest`에 단계별 로그를 남기며, 무한 대기에 빠진 지점은 **마지막 로그 줄 다음 단계**에서 발생한다. "파일 I/O 무한 블록"은 **존재하지 않는 드라이브나 네트워크 경로 참조**에서 가장 흔하고, Windows 환경에서 특히 잘 발생한다. `settings.local.json`은 PC별 개인 파일이므로 반드시 `.gitignore` 대상이어야 한다.
+
+## 관련 문서
+
+- [Claude Code IDE 연결 오류 해결 (lock 파일)](./claude-code-ide-lock-files.mdx) — VS Code 확장이 IDE에 연결되지 않을 때 `~/.claude/ide/*.lock` 잔존 파일 진단·정리·자동화

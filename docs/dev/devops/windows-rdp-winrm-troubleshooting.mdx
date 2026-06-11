@@ -1,0 +1,194 @@
+---
+title: "Windows 원격 접속(RDP/WinRM) 트러블슈팅 — 단계별 원인 좁히기"
+description: "RDP가 안 될 때 네트워크→포트→리스너→NLA 순으로 원인을 좁히는 진단법과 NLA/CredSSP, NAC 환경의 함정"
+category: "dev/devops"
+date: "2026-06-11"
+tags: ["windows", "rdp", "winrm", "nla", "credssp", "powershell", "troubleshooting", "nac"]
+---
+
+# Windows 원격 접속(RDP/WinRM) 트러블슈팅 — 단계별 원인 좁히기
+
+"원격 데스크톱이 안 된다"는 한 문장에는 완전히 다른 원인이 여러 겹 숨어 있다.
+추측으로 설정을 이것저것 만지는 대신, **어디서 끊기는지를 한 단계씩 좁히는** 진단법을 정리한다.
+
+## 핵심 개념
+
+원격 접속 실패는 **연결 경로의 어느 지점에서 끊기느냐**로 원인이 갈린다:
+
+```
+내 PC ──①네트워크──> 서버 ──②포트(3389)──> ③RDP 리스너 ──④NLA 인증──> 로그인 화면
+        (ping)         (TCP)         (Listen)        (CredSSP)
+```
+
+| 끊기는 지점 | 증상 | 도구 |
+|---|---|---|
+| ① 네트워크 | "연결할 수 없음 / 시간 초과", ping 실패 | `Test-NetConnection` PingSucceeded |
+| ② 포트 | ping은 되는데 접속 안 됨 | `Test-NetConnection -Port 3389` TcpTestSucceeded |
+| ③ 리스너 | 포트 설정·방화벽 다 정상인데 포트가 안 열림 | `Get-NetTCPConnection -State Listen` |
+| ④ NLA 인증 | 자격 증명 화면 전에 "로컬 보안 기관에 연결 불가" | NLA/CredSSP 설정·계정 |
+
+## 상세 설명
+
+### ① · ② 네트워크와 포트 도달성
+
+가장 먼저, **접속하는 쪽(클라이언트)에서** 한 줄로 ①②를 동시에 판별한다.
+
+```powershell
+Test-NetConnection 192.168.0.50 -Port 3389
+```
+
+결과 해석:
+
+```
+PingSucceeded    : True    # ① 호스트는 살아있고 네트워크 도달 OK
+TcpTestSucceeded : False   # ② 3389 포트만 막힘
+```
+
+- `PingSucceeded=False` → ① 네트워크/IP 문제 (서브넷 불일치, 라우팅, IP 오타)
+- `PingSucceeded=True, TcpTestSucceeded=False` → 호스트는 닿지만 **포트만** 막힘 → ②③④로 진행
+- 둘 다 True → 포트는 열림 → 클라이언트(mstsc) 설정·계정 문제
+
+> **팁 — "서버 문제 vs 중간 네트워크 문제" 가르기:** 다른 포트(예: WinRM 5985)도 같이 찔러본다.
+> 5985는 True인데 3389만 False라면, 중간 라우터/방화벽이 아니라 **서버 쪽 RDP만의 문제**로 확정된다.
+
+```powershell
+Test-NetConnection 192.168.0.50 -Port 5985   # WinRM 살아있나?
+```
+
+### ③ RDP 리스너 — "다 켰는데 포트가 안 열림"의 진짜 원인
+
+서버에서 RDP가 분명 켜져 있고 방화벽도 허용인데 3389가 안 열리는 경우가 있다.
+서버에서 아래를 모두 확인한다:
+
+```powershell
+# RDP 켜짐? (0이어야 함)
+(Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server').fDenyTSConnections
+
+# 방화벽 규칙 (언어 무관 그룹 ID), Enabled=True / Profile이 현재 네트워크 포함?
+Get-NetFirewallRule -Group '@FirewallAPI.dll,-28752' | Select DisplayName, Profile, Enabled
+
+# 현재 네트워크 프로필 (방화벽 Profile과 비교)
+Get-NetConnectionProfile | Select Name, NetworkCategory
+
+# 서비스 Running?
+Get-Service TermService
+
+# ★ 핵심: 정말 3389를 "듣고" 있나?
+Get-NetTCPConnection -LocalPort 3389 -State Listen
+
+# 포트가 바뀌진 않았나?
+(Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp').PortNumber
+```
+
+여기서 자주 나오는 두 함정:
+
+1. **방화벽 Profile 불일치** — 규칙은 `Enabled=True`인데 `Profile`이 `Domain, Private`뿐이고 현재 네트워크가 `Public`이면, 규칙이 무시된다. `Profile=Any`로 만들거나 모든 프로필 허용 규칙을 추가한다.
+
+2. **리스너가 죽음** — `fDeny=0` + 방화벽 OK + 서비스 `Running`인데도 `Get-NetTCPConnection ... -State Listen`이 **빈 결과**다. 즉 서비스는 떠 있지만 리스너가 3389에 바인딩되지 않았다.
+   - `TermService`는 **보호 서비스**라 `Restart-Service`로 중지가 안 된다 (`StopServiceFailed`).
+   - **해결: 서버 재부팅.** 부팅 시 리스너가 처음부터 3389에 다시 바인딩된다.
+
+### ④ NLA와 CredSSP — "로컬 보안 기관에 연결할 수 없습니다"
+
+포트(③)까지 열렸는데, RDP 창에서 자격 증명 화면도 못 보고 다음 에러로 튕긴다:
+
+> **인증 오류가 발생했습니다. 로컬 보안 기관에 연결할 수 없습니다.**
+> (The Local Security Authority cannot be contacted)
+
+**NLA(Network Level Authentication)** 는 로그인 화면을 띄우기 **전에** 네트워크 단에서 계정·비번을
+먼저 엄격히 검증하는 보안 기능이다. 이 사전 인증(CredSSP 협상)이 실패하면, 친절한 "비번 틀림"
+대신 위처럼 **뭉뚱그린 에러**로 막아버린다.
+
+원인은 보통 둘:
+
+- **계정/비번이 틀림** — 사전 인증에 틀린 자격증명을 들이밀면 LSA 검증 실패. (예: ID 칸이 한글 입력 상태로 바뀌어 영문 ID가 깨지는 경우, 캐시된 엉뚱한 계정, 비번 혼동)
+- **CredSSP 보안 정책 불일치** — 클라이언트와 서버의 CredSSP 패치/정책 수준이 안 맞을 때. (대표적으로 "Encryption Oracle Remediation")
+
+해결 갈래:
+
+```powershell
+# (갈래 A) 서버에서 NLA 끄기 — 사전 인증을 건너뛰고 일반 로그인 화면으로
+Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+  -Name UserAuthentication -Value 0
+
+# (갈래 B) 클라이언트에서 CredSSP 정책 완화 (패치 안 된 서버에 접속할 때)
+New-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters' -Force | Out-Null
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters' `
+  -Name AllowEncryptionOracle -Value 2 -Type DWord
+```
+
+> **함정:** "업데이트로 CredSSP를 고친다"가 답일 때도 있지만, 먼저 **서버 패치 상태부터 확인**하라.
+> 미설치 업데이트가 MSRT(악성SW제거도구) 하나뿐이라면 서버는 이미 최신이고, 업데이트는 RDP 문제와 무관하다.
+> 그땐 NLA/계정 쪽이 원인이다.
+
+```powershell
+# 서버에서 미설치 업데이트 조회 (온라인, 1~5분 소요)
+$s = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+$r = $s.Search("IsInstalled=0")
+"미설치: $($r.Updates.Count) 개"; $r.Updates | ForEach-Object { $_.Title }
+```
+
+### 빈 비밀번호 계정은 원격 로그온 불가
+
+별개의 함정 하나: **비밀번호가 빈 계정은 Windows 기본 정책상 원격(RDP/WinRM) 로그온이 차단**된다
+(`Accounts: Limit local account use of blank passwords to console logon only`). 콘솔(직접 로그인)만 된다.
+→ 원격용 계정에는 반드시 비밀번호를 설정한다.
+
+```powershell
+$pw = Read-Host -AsSecureString
+Set-LocalUser -Name "user" -Password $pw
+```
+
+## 실제 코드 예시 — WinRM을 안전망으로
+
+RDP(3389)가 죽어도 **WinRM(5985)을 함께 열어두면 원격으로 들어가 RDP를 고칠 수 있다.**
+실제 운영에서 결정적이었던 패턴이다.
+
+```powershell
+# 출처: print-to-email/deploy/remote-control/2-here-connect.ps1 (발췌)
+param(
+    [Parameter(Mandatory=$true)][string]$TargetIP,
+    [string]$User,
+    [string]$Password   # 평문 비번(선택). 주면 입력창 없이 자동 접속. ⚠ git 금지
+)
+
+# TrustedHosts 등록 (작업그룹 환경)
+Set-Item WSMan:\localhost\Client\TrustedHosts -Value $TargetIP -Force
+
+# 포트 5985 도달 확인 후 세션 접속
+$t = Test-NetConnection $TargetIP -Port 5985 -WarningAction SilentlyContinue
+if (-not $t.TcpTestSucceeded) { Write-Host "[실패] 5985 도달 불가"; return }
+
+if ($Password) {
+    $sec  = ConvertTo-SecureString $Password -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential($User, $sec)
+} else {
+    $cred = Get-Credential -UserName $User
+}
+Enter-PSSession -ComputerName $TargetIP -Credential $cred
+```
+
+작업그룹(비도메인) 환경에서 계정 형식은 `컴퓨터\계정` 또는 `IP\계정`:
+
+```powershell
+.\2-here-connect.ps1 -TargetIP 192.168.0.50 -User 192.168.0.50\admin
+```
+
+## NAC(예: Genian) 환경의 추가 리스크
+
+망분리 + NAC(Network Access Control)가 있는 환경에서는 **무인 재부팅이 가장 위험**하다.
+재부팅하면 부팅 후 NAC 로그인을 통과해야 망이 열리는데, 그걸 원격에서 할 수 없으면
+**서버가 망에서 차단되어 RDP·WinRM 둘 다 끊긴다.** 결국 사람이 서버 앞에 가야 복구된다.
+
+→ NAC 자동 로그인(부팅 시 시작프로그램에서 GUI 자동 입력) + Windows 자동 로그인(`AutoAdminLogon`)을
+**미리 설치하고 재부팅 전에 테스트**해 두어야 무인 운영이 가능하다.
+
+## 핵심 정리
+
+> **원격 접속 진단은 "경로를 따라 한 단계씩 좁히기"다.**
+>
+> 1. `Test-NetConnection IP -Port 3389` → Ping/TCP로 ①네트워크와 ②포트를 동시 판별
+> 2. 다른 포트(5985)도 찔러 "서버 문제 vs 중간 네트워크" 가르기
+> 3. 서버에서 ③ `Get-NetTCPConnection -State Listen` 으로 **실제 청취 여부** 확인 — 설정이 다 맞아도 리스너가 죽을 수 있다(→ 재부팅)
+> 4. ④ "LSA 연결 불가"는 NLA 사전 인증 실패 — 계정/비번 오타이거나 CredSSP 불일치. 서버 패치 상태부터 확인
+> 5. 빈 비번 계정은 원격 불가, NAC 환경은 재부팅 = 망 차단 리스크 — WinRM을 안전망으로 함께 열어둘 것

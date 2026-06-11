@@ -1,0 +1,123 @@
+---
+title: "Claude Code IDE 연결 오류 해결 (lock 파일)"
+description: "VS Code Claude Code 확장의 IDE 연결 실패 원인 진단과 좀비 lock 파일 자동 정리"
+category: "etc/tool"
+date: "2026-05-14"
+tags: ["claude-code", "vscode", "powershell", "troubleshooting", "lock-file"]
+---
+
+# Claude Code IDE 연결 오류 해결 (lock 파일)
+
+VS Code의 Claude Code 확장이 IDE에 연결되지 않을 때, `~/.claude/ide/*.lock` 잔존 파일이 원인인 경우가 많다. 원인·진단·근본 대응을 정리한다.
+
+## 증상
+
+- VS Code 통합 터미널에서 `claude` 실행 시 IDE 연결 안 됨
+- 확장이 활성화되어 있는데도 IDE 기능(파일 컨텍스트, selection 등) 동작 안 함
+- 특히 **여러 VS Code 창을 동시에 자주 켜고 끄는** 사용 패턴에서 빈번
+
+## 원인: 좀비 lock 파일
+
+`~/.claude/ide/` 폴더에는 IDE-CLI 간 IPC용 lock 파일이 있다.
+
+- **파일명 형식**: `<PID>.lock` (예: `17952.lock`, `60927.lock`)
+- **내용**: 해당 VS Code 확장 프로세스의 연결 정보 (포트 등, 약 200 bytes)
+- **수명**: VS Code 종료 시 해당 lock 파일이 정리되어야 함
+
+VS Code가 비정상 종료되거나, 여러 창이 동시에 떠 있다가 한꺼번에 죽으면 lock 파일이 잔존한다. 이후 새로 켠 Claude Code가 stale lock을 살아있는 세션으로 오인해 연결을 거부한다.
+
+## 진단
+
+### 1. lock 폴더 확인
+
+```powershell
+$path = "$env:USERPROFILE\.claude\ide"
+if (Test-Path $path) {
+    Write-Output "Directory exists: $path"
+    Get-ChildItem $path
+} else {
+    Write-Output "Directory does not exist"
+}
+```
+
+### 2. lock 파일 상세
+
+```powershell
+Get-ChildItem "$env:USERPROFILE\.claude\ide\*.lock" |
+    Select-Object FullName, Length, LastWriteTime
+```
+
+여러 개가 나오면 좀비 lock 가능성이 높다. 특히 `LastWriteTime`이 오래된 파일은 거의 확실히 좀비.
+
+## 응급 처치: 수동 삭제
+
+VS Code를 **모두 종료**한 뒤:
+
+```powershell
+Remove-Item "$env:USERPROFILE\.claude\ide\*.lock" -Force
+```
+
+이후 VS Code 다시 열고 `claude` 실행 → 정상 연결.
+
+> ⚠️ VS Code가 켜져 있는 상태에서 삭제하면 살아있는 세션의 lock도 지워져 다른 창의 Claude Code가 끊긴다.
+
+## 근본 대응: PowerShell 프로필 자동화
+
+여러 창을 동시에 쓰는 패턴을 유지하면서 lock 누적을 막는 방법.
+
+**PowerShell 프로필**(`$PROFILE`)은 PowerShell 시작 시 자동 실행되는 스크립트 — bash `.bashrc` 대응.
+
+`$PROFILE`에 다음 함수를 추가하면, `claude` 실행 시 자동으로 **죽은 PID의 lock만** 정리하고 살아있는 세션은 보호한다.
+
+```powershell
+function claude {
+    Get-ChildItem "$env:USERPROFILE\.claude\ide\*.lock" -ErrorAction SilentlyContinue | ForEach-Object {
+        $pidFromName = $_.BaseName
+        if (-not (Get-Process -Id $pidFromName -ErrorAction SilentlyContinue)) {
+            Remove-Item $_.FullName -Force
+        }
+    }
+    & claude.exe @args
+}
+```
+
+### 작동 원리
+
+1. lock 파일명에서 PID 추출 (`17952.lock` → `17952`)
+2. `Get-Process -Id <PID>`로 해당 프로세스 생존 확인
+3. 죽은 PID의 lock만 삭제 → **살아있는 다른 창의 lock은 건드리지 않음**
+4. 정리 후 원본 `claude.exe` 실행
+
+### 설정 절차
+
+```powershell
+# 1. 프로필 경로 확인
+$PROFILE
+
+# 2. 프로필 파일 없으면 생성
+if (-not (Test-Path $PROFILE)) {
+    New-Item -ItemType File -Path $PROFILE -Force
+}
+
+# 3. 위 함수 코드를 $PROFILE 파일에 추가 (편집기로 열어 붙여넣기)
+notepad $PROFILE
+
+# 4. 새 PowerShell 창에서 적용 확인
+claude --version
+```
+
+## 대안: 짧은 정리 alias
+
+프로필 함수가 부담스러우면, 명시적인 청소 명령만 등록해두는 방법.
+
+```powershell
+function clc { Remove-Item "$env:USERPROFILE\.claude\ide\*.lock" -Force }
+```
+
+연결이 안 될 때만 `clc` 한 번 친 뒤 `claude` 재실행.
+
+## 핵심 정리
+
+> - `~/.claude/ide/*.lock`은 PID 기반 IPC lock — VS Code 비정상 종료 시 잔존하면 다음 연결을 막는다.
+> - 응급 처치: VS Code 전체 종료 후 `Remove-Item ...\*.lock -Force`.
+> - 근본 대응: PowerShell 프로필에 PID 생존 확인 후 stale lock만 지우는 `claude` 래퍼 함수 등록 → 다중 창 사용 패턴과 양립.
